@@ -6,20 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log"
 	mrand "math/rand"
+	standard_http "net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
-
-	standard_http "net/http"
-
-	"errors"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -48,6 +46,13 @@ const (
 	productThumbnailFormat = "png" // Desired format for product thumbnail
 	productThumbnailWidth  = 150   // Desired width for product thumbnail
 	productThumbnailHeight = 150   // Desired height for product thumbnail
+
+	// ANSI Color Codes for logging
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	// colorBlue   = "\033[34m" // Example, add if needed
 )
 
 // --- Configuration Variables (to be loaded from .env or defaults) ---
@@ -261,8 +266,6 @@ type IPResponse struct {
 	IP string `json:"ip"`
 }
 
-// shuffleProxies shuffles the loadedProxies slice in place.
-// It uses the global mrand.Rand which should be seeded.
 func shuffleProxies(proxies []string) {
 	// No need to lock here if this is called from a single goroutine context
 	// before distributing work, or if proxies slice is copied first.
@@ -412,7 +415,6 @@ func validateProxies(initialProxies []string) []string {
 }
 
 func main() {
-	// Load .env file at the very beginning
 	errEnv := godotenv.Load()
 	if errEnv != nil {
 		if !os.IsNotExist(errEnv) {
@@ -430,9 +432,7 @@ func main() {
 	if discordWebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE" || discordWebhookURL == "" {
 		log.Println("WARN: DISCORD_WEBHOOK_URL is not set or is using the default placeholder. Notifications will likely fail.")
 	}
-	// No need to log the other config values here again as getEnv does it.
 
-	mrand.Seed(time.Now().UnixNano())
 	lastNotificationSent = make(map[string]time.Time)
 	lastKnownStockState = make(map[string]bool)
 	quickRecheckCounters = make(map[string]int)
@@ -937,8 +937,16 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 	}
 	// --- End Product Image URL Caching Logic ---
 
+	// Apply color to shippingStatus for this log line
+	coloredShippingStatus := shippingStatus
+	if strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0 {
+		coloredShippingStatus = colorGreen + shippingStatus + colorReset
+	} else if strings.Contains(strings.ToUpper(shippingStatus), "OUT_OF_STOCK") || strings.Contains(strings.ToUpper(shippingStatus), "UNAVAILABLE") {
+		coloredShippingStatus = colorRed + shippingStatus + colorReset
+	} // Other statuses (like PRE_ORDER_UNSELLABLE) will remain default color
+
 	log.Printf("TCIN %s (%s via %s): '%s' - Price: %s, Shipping Status: %s, Qty: %.0f",
-		product.TCIN, apiType, client.GetProxy(), cleanedTitle, product.Price.FormattedCurrentPrice, shippingStatus, availableQty)
+		product.TCIN, apiType, client.GetProxy(), cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty)
 
 	isInStock := strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0
 
@@ -956,12 +964,13 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 				product.TCIN, apiType, client.GetProxy(), lastSentTime.Format(time.RFC1123), (cooldownDuration - time.Since(lastSentTime)).Round(time.Second), cleanedTitle)
 			lastNotificationMutex.Unlock()
 		} else {
-			log.Printf("TCIN %s (%s via %s): IN STOCK! Title: %s. Qty: %.0f. Preparing notification.", product.TCIN, apiType, client.GetProxy(), cleanedTitle, availableQty)
+			log.Printf("TCIN %s (%s via %s): %sIN STOCK!%s Title: %s. Qty: %.0f. Preparing notification.",
+				product.TCIN, apiType, client.GetProxy(), colorGreen, colorReset, cleanedTitle, availableQty)
 			lastNotificationSent[tcin] = time.Now()
 			lastNotificationMutex.Unlock()
 
 			if discordWebhookURL != "YOUR_DISCORD_WEBHOOK_URL_HERE" && !strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE") {
-				sendDiscordNotification(cleanedTitle, product.Price.FormattedCurrentPrice, product.TCIN, "", finalProductThumbnailURL, availableQty)
+				sendDiscordNotification(cleanedTitle, product.Price.FormattedCurrentPrice, product.TCIN, finalProductThumbnailURL, availableQty)
 			} else {
 				log.Printf("TCIN %s (%s via %s): Would send Discord notification, but webhook URL is not set.", product.TCIN, apiType, client.GetProxy())
 			}
@@ -975,7 +984,8 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		recheckMutex.Unlock()
 
 	} else {
-		log.Printf("TCIN %s (%s via %s): OUT OF STOCK. Title: %s", product.TCIN, apiType, client.GetProxy(), cleanedTitle)
+		log.Printf("TCIN %s (%s via %s): %sOUT OF STOCK%s. Title: %s",
+			product.TCIN, apiType, client.GetProxy(), colorRed, colorReset, cleanedTitle)
 		if !isQuickRecheck && (!stateKnown || previousState) {
 			recheckMutex.Lock()
 			quickRecheckCounters[tcin] = quickRecheckCount
@@ -986,8 +996,8 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 	return nil
 }
 
-// sendDiscordNotification updated to include seconds in the timestamp.
-func sendDiscordNotification(title, price, tcin, productURL, productThumbnailURL string, availableQuantity float64) {
+// sendDiscordNotification updated to remove unused productURL parameter.
+func sendDiscordNotification(title, price, tcin string, productThumbnailURL string, availableQuantity float64) {
 	if discordWebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE" || strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE") {
 		log.Println("Discord webhook URL not configured or placeholder. Skipping notification.")
 		return
@@ -1011,8 +1021,8 @@ func sendDiscordNotification(title, price, tcin, productURL, productThumbnailURL
 	yNotif, mNotif, dNotif := notificationTimeInLoc.Date()
 	yCurr, mCurr, dCurr := currentTimeInLoc.Date()
 
-	timeOnlyFormatWithSeconds := "3:04:05 PM"                         // Added seconds
-	fullDateTimeFormatWithSeconds := "Mon, Jan 2, 2006 at 3:04:05 PM" // Added seconds
+	timeOnlyFormatWithSeconds := "3:04:05 PM"
+	fullDateTimeFormatWithSeconds := "Mon, Jan 2, 2006 at 3:04:05 PM"
 
 	if yNotif == yCurr && mNotif == mCurr && dNotif == dCurr {
 		timestampStr = fmt.Sprintf("Today at %s", notificationTimeInLoc.Format(timeOnlyFormatWithSeconds))
