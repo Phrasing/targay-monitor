@@ -267,12 +267,11 @@ type IPResponse struct {
 }
 
 func shuffleProxies(proxies []string) {
-	// No need to lock here if this is called from a single goroutine context
-	// before distributing work, or if proxies slice is copied first.
-	// For now, called in main loop and quickRecheckWorker before further concurrency for that batch.
-	mrand.Shuffle(len(proxies), func(i, j int) {
-		proxies[i], proxies[j] = proxies[j], proxies[i]
-	})
+	if len(proxies) > 0 {
+		mrand.Shuffle(len(proxies), func(i, j int) {
+			proxies[i], proxies[j] = proxies[j], proxies[i]
+		})
+	}
 }
 
 // loadProxies reads proxies from a file and formats them for tls-client
@@ -323,7 +322,7 @@ func loadProxies(filePath string) ([]string, error) {
 		log.Printf("INFO: Proxy file '%s' is empty or contains only comments. Continuing without proxies.", filePath)
 	}
 	if len(proxies) > 0 {
-		log.Printf("Successfully loaded %d proxy candidates from '%s'. Validating them now...", len(proxies), filePath)
+		log.Printf("Successfully loaded %d proxy candidates from '%s'.", len(proxies), filePath)
 	}
 	return proxies, nil
 }
@@ -996,17 +995,17 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 	return nil
 }
 
-// sendDiscordNotification updated to remove unused productURL parameter.
-func sendDiscordNotification(title, price, tcin string, productThumbnailURL string, availableQuantity float64) {
+// sendDiscordNotification updated to remove the @here ping logic.
+func sendDiscordNotification(title, price, tcin, productThumbnailURL string, availableQuantity float64) {
 	if discordWebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE" || strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE") {
 		log.Println("Discord webhook URL not configured or placeholder. Skipping notification.")
 		return
 	}
 
-	var messageContent string
-	if availableQuantity >= 10 {
-		messageContent = "@here"
-	}
+	// var messageContent string // Logic for @here removed
+	// if availableQuantity >= 10 {
+	// 	messageContent = "@here"
+	// }
 
 	notificationTime := time.Now()
 	var timestampStr string
@@ -1014,16 +1013,12 @@ func sendDiscordNotification(title, price, tcin string, productThumbnailURL stri
 	if locToUse == nil {
 		locToUse = time.Local
 	}
-
 	notificationTimeInLoc := notificationTime.In(locToUse)
 	currentTimeInLoc := time.Now().In(locToUse)
-
 	yNotif, mNotif, dNotif := notificationTimeInLoc.Date()
 	yCurr, mCurr, dCurr := currentTimeInLoc.Date()
-
 	timeOnlyFormatWithSeconds := "3:04:05 PM"
 	fullDateTimeFormatWithSeconds := "Mon, Jan 2, 2006 at 3:04:05 PM"
-
 	if yNotif == yCurr && mNotif == mCurr && dNotif == dCurr {
 		timestampStr = fmt.Sprintf("Today at %s", notificationTimeInLoc.Format(timeOnlyFormatWithSeconds))
 	} else {
@@ -1066,7 +1061,7 @@ func sendDiscordNotification(title, price, tcin string, productThumbnailURL stri
 	}
 
 	message := DiscordMessage{
-		Content:  messageContent,
+		// Content field will be empty, effectively removing @here ping
 		Username: "Targay Monitor",
 		Embeds:   []DiscordEmbed{embed},
 	}
