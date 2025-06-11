@@ -1,0 +1,19 @@
+# Environment configuration
+.env
+
+# Proxy list
+proxies.txt
+
+# Other local text files (data, logs, etc.)
+*.txt
+
+# Compiled Go binaries
+targay
+__debug_bin*
+
+# IDE and OS specific files (optional but good practice)
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

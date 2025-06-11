@@ -1,0 +1,3 @@
+[submodule "third-party/tls-client"]
+	path = third-party/tls-client
+	url = https://github.com/bogdanfinn/tls-client.git
