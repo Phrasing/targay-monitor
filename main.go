@@ -59,22 +59,28 @@ var (
 	// List of TCINs to monitor
 	tcinsToMonitor = []string{"94300069", "94681785", "94636854", "94681770", "94636862", "94721086", "94636860", "94641043"} // Added TCIN from desktop example
 
-	// Mobile API specific parameters (largely from original target_request_data.txt)
-	mobileStoreID    = "2364"
-	mobileZipCode    = "32136-3126"
-	mobileState      = "FL"
-	mobileVisitorID  = "019732c1373d01049E709C90A0F54AF2"
+	// Store contexts to rotate through - UPDATED with user-provided data
+	storeContexts = []StoreContext{
+		{StoreID: "2364", ZipCode: "32136-3126", State: "FL"}, // Original Florida context
+		{StoreID: "1016", ZipCode: "23834-3605", State: "VA"},
+		{StoreID: "1017", ZipCode: "23831-5350", State: "VA"},
+		{StoreID: "1292", ZipCode: "24073-1151", State: "VA"},
+		// Removed other placeholder stores, user can add more if needed following this format
+	}
+
+	// Mobile API specific parameters (some are now dynamic or per-context)
 	mobileAPIKey     = "3f015bca9bce7dbb2b377638fa5de0f229713c78"
 	mobileAppVersion = "2025.21.0"
-	mobileXRequestID = "3E484855-9FAB-4ECE-9DCF-41F5A9D2ABCD"
-	mobileLoyaltyID  = "tly.01dc4ba6b1784977afbce47f34d83e5a"
-	mobileMemberID   = "10044685289"
+	// mobileStoreID, mobileZipCode, mobileState removed as they are now part of StoreContext
+	// mobileVisitorID, mobileLoyaltyID, mobileMemberID are per-worker/per-call
+	// mobileXRequestID is per-request
 
-	// Desktop API specific parameters (from target_desktop_api_request.txt)
-	// Note: Desktop API in example doesn't use bearer token, x-scr, x-client-version etc.
+	// These might still be needed if re-introducing store context or for reference
+	defaultMobileStoreID = "2364"
+	// defaultMobileLoyaltyIDTemplate = "tly.01dc4ba6b1784977afbce47f34d83e5a"
+	// defaultMobileMemberIDTemplate  = "10044685289"
 
-	loadedProxies             []string
-	currentMainLoopProxyIndex uint64 // Renamed for clarity
+	loadedProxies []string
 
 	// Map to store the last notification time for each TCIN
 	lastNotificationSent  map[string]time.Time
@@ -130,6 +136,13 @@ var (
 		fmt.Sprintf("Target/%s iPad13,16 iOS/18.4 CFNetwork/3820.200.112 Darwin/24.4.0", mobileAppVersion),
 	}
 )
+
+// StoreContext holds StoreID, ZipCode, and State for API requests
+type StoreContext struct {
+	StoreID string
+	ZipCode string
+	State   string
+}
 
 // Helper function to get environment variables with a fallback default
 func getEnv(key, fallback string) string {
@@ -467,7 +480,13 @@ func main() {
 
 	log.Printf("Initializing %d main monitoring workers...", numMonitoringWorkers)
 	staggerDelay := time.Duration(0)
-	if numMonitoringWorkers > 0 {
+	if numMonitoringWorkers > 0 && len(storeContexts) > 0 {
+		// Stagger based on number of workers OR number of store contexts, whichever provides finer grained staggering
+		staggerDivisor := numMonitoringWorkers
+		// If we want each worker to start on a new store context (round robin), stagger by store contexts if more numerous
+		// For now, simple stagger by worker count
+		staggerDelay = (time.Duration(checkIntervalSeconds) * time.Second) / time.Duration(staggerDivisor)
+	} else if numMonitoringWorkers > 0 {
 		staggerDelay = (time.Duration(checkIntervalSeconds) * time.Second) / time.Duration(numMonitoringWorkers)
 	}
 
@@ -485,8 +504,10 @@ func main() {
 			log.Fatalf("WORKER %d: Failed to create Main Mobile TLS client: %v", workerID, err)
 		}
 		log.Printf("WORKER %d: Main Mobile API client initialized.", workerID)
-		go monitoringWorker(workerID, workerClient)
-		if workerID < numMonitoringWorkers-1 {
+		// Each worker gets its initial store context index offset by its ID to try and start them on different stores
+		initialStoreContextIndex := uint64(workerID % len(storeContexts)) // Ensure this doesn't panic if storeContexts is empty (checked above for staggerDelay)
+		go monitoringWorker(workerID, workerClient, initialStoreContextIndex)
+		if workerID < numMonitoringWorkers-1 && staggerDelay > 0 {
 			time.Sleep(staggerDelay)
 		}
 	}
@@ -495,7 +516,7 @@ func main() {
 	select {}
 }
 
-func monitoringWorker(workerID int, initialClient tls_client.HttpClient) {
+func monitoringWorker(workerID int, initialClient tls_client.HttpClient, initialStoreContextIdx uint64) {
 	log.Printf("WORKER %d: Started.", workerID)
 	client := initialClient // Use the client passed in, allow it to be replaced
 	var currentWorkerProxyIndex uint64
@@ -503,15 +524,20 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient) {
 	var consecutiveBadCycles int
 	currentProfileIndex := -1                      // -1 means using the initial profile, 0 and up for alternatives
 	currentUsedHelloID := mainClientInitialProfile // Track the HelloID currently in use by this worker's client
+	currentStoreCtxIndex := initialStoreContextIdx
 
 	// Worker-specific, semi-persistent identifiers
 	workerVisitorID, err := generateRandomHexString(32)
 	if err != nil {
-		log.Printf("ERROR: WORKER %d: Failed to generate VisitorID: %v. Using a default static one.", workerID, err)
+		log.Printf("ERROR: WORKER %d: Failed to generate VisitorID: %v. Using a default.", workerID, err)
 		workerVisitorID = "01010101010101010101010101010101" // Fallback
 	}
-	workerUserAgent := validIOSUserAgents[mrand.Intn(len(validIOSUserAgents))] // Randomly select one UA for this worker
-	log.Printf("WORKER %d: Using VisitorID: %s, User-Agent: %s", workerID, workerVisitorID, workerUserAgent)
+	randomHexForLoyalty, _ := generateRandomHexString(32)
+	workerLoyaltyID := "tly." + randomHexForLoyalty
+	workerMemberID := generateRandomNumericString(10) // e.g., 10-digit member ID
+	workerUserAgent := validIOSUserAgents[mrand.Intn(len(validIOSUserAgents))]
+	log.Printf("WORKER %d: Using VisitorID: %s, LoyaltyID: %s, MemberID: %s, User-Agent: %s",
+		workerID, workerVisitorID, workerLoyaltyID, workerMemberID, workerUserAgent)
 
 	for {
 		if currentBackoffDuration > 0 {
@@ -521,7 +547,8 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient) {
 			log.Printf("WORKER %d: Backoff complete. Resuming normal cycle.", workerID)
 		}
 
-		log.Printf("WORKER %d: Starting new check cycle.", workerID)
+		log.Printf("WORKER %d: Starting new check cycle using StoreID: %s, Zip: %s, State: %s.",
+			workerID, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].StoreID, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].ZipCode, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].State)
 
 		workerProxies := make([]string, len(loadedProxies))
 		copied := false
@@ -542,19 +569,21 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient) {
 				proxyToUse = workerProxies[proxyIndex]
 			}
 
-			go func(currentTCIN string, currentProxy string) {
+			go func(currentTCIN string, currentProxy string, sc StoreContext) {
 				defer workerCycleWg.Done()
 				if currentProxy != "" {
 					if err := client.SetProxy(currentProxy); err != nil {
 						log.Printf("WARN: WORKER %d - TCIN %s: Failed to set proxy %s: %v.", workerID, currentTCIN, currentProxy, err)
 					}
 				}
-				// Pass worker-specific visitorID and userAgent
-				err := checkProductMobileAPIAndNotify(client, currentTCIN, false, workerVisitorID, workerUserAgent)
-				if errors.Is(err, ErrRateLimited) || errors.Is(err, ErrNotFound) { // Treat 404 also as a trigger for action
+				// Pass worker-specific identifiers AND current store context
+				err := checkProductMobileAPIAndNotify(client, currentTCIN, false,
+					workerVisitorID, workerUserAgent, workerLoyaltyID, workerMemberID,
+					sc.StoreID, sc.ZipCode, sc.State)
+				if errors.Is(err, ErrRateLimited) || errors.Is(err, ErrNotFound) {
 					cycleHadErrorsRequiringAction = true
 				}
-			}(tcin, proxyToUse)
+			}(tcin, proxyToUse, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))])
 		}
 
 		if copied && len(workerProxies) > 0 {
@@ -628,6 +657,9 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient) {
 		actualSleepDuration := baseInterval + jitter
 		log.Printf("WORKER %d: --- Waiting for %s (base: %.0fs, jitter: %s) before next check cycle ---", workerID, actualSleepDuration, checkIntervalSeconds, jitter)
 		time.Sleep(actualSleepDuration)
+
+		// Advance store context for the next cycle for this worker
+		currentStoreCtxIndex = (currentStoreCtxIndex + 1) % uint64(len(storeContexts))
 	}
 }
 
@@ -663,6 +695,18 @@ func quickRecheckWorker() {
 				copied = true
 			}
 
+			// Quick re-checks can pick a store context, e.g., randomly or cycle like main workers
+			// For simplicity, let's use a random store context for each batch of quick re-checks
+			var selectedStoreContext StoreContext
+			if len(storeContexts) > 0 {
+				selectedStoreContext = storeContexts[mrand.Intn(len(storeContexts))]
+				log.Printf("QUICK RE-CHECK WORKER: Using StoreContext: ID %s, Zip %s for this batch.", selectedStoreContext.StoreID, selectedStoreContext.ZipCode)
+			} else {
+				log.Printf("WARN: QUICK RE-CHECK WORKER: No store contexts available. This might lead to errors.")
+				// Fallback to default if no store contexts - this requires defaultStoreID etc. to be defined
+				selectedStoreContext = StoreContext{StoreID: defaultMobileStoreID, ZipCode: "00000", State: "XX"} // Placeholder
+			}
+
 			var quickCheckWg sync.WaitGroup
 			for i, tcinToRecheck := range tcinsToActuallyRecheckThisIteration {
 				quickCheckWg.Add(1)
@@ -671,17 +715,22 @@ func quickRecheckWorker() {
 					proxyIndex := i % len(workerQuickRecheckProxies)
 					proxyToUse = workerQuickRecheckProxies[proxyIndex]
 				}
-				go func(currentTCIN string, currentProxy string) {
+				go func(currentTCIN string, currentProxy string, sc StoreContext) {
 					defer quickCheckWg.Done()
 					if currentProxy != "" {
 						if err := quickRecheckMobileClient.SetProxy(currentProxy); err != nil {
-							log.Printf("WARN: QUICK RE-CHECK - TCIN %s: Failed to set proxy %s for Quick Re-check Client: %v.", currentTCIN, currentProxy, err)
+							log.Printf("WARN: QUICK RE-CHECK - TCIN %s: Failed to set proxy %s: %v.", currentTCIN, currentProxy, err)
 						}
 					}
 					// Generate fresh identifiers for each quick re-check call for max variability
-					quickVisitorID, _ := generateRandomHexString(32) // Ignoring error for simplicity here, or use a fallback
+					quickVisitorID, _ := generateRandomHexString(32)
+					randomHexForLoyalty, _ := generateRandomHexString(32)
+					quickLoyaltyID := "tly." + randomHexForLoyalty
+					quickMemberID := generateRandomNumericString(10)
 					quickUserAgent := validIOSUserAgents[mrand.Intn(len(validIOSUserAgents))]
-					err := checkProductMobileAPIAndNotify(quickRecheckMobileClient, currentTCIN, true, quickVisitorID, quickUserAgent)
+					err := checkProductMobileAPIAndNotify(quickRecheckMobileClient, currentTCIN, true,
+						quickVisitorID, quickUserAgent, quickLoyaltyID, quickMemberID,
+						sc.StoreID, sc.ZipCode, sc.State)
 					if errors.Is(err, ErrRateLimited) {
 						log.Printf("WARN: QUICK RE-CHECK - TCIN %s (via %s): Received rate limit error (429).", currentTCIN, quickRecheckMobileClient.GetProxy())
 					} else if errors.Is(err, ErrNotFound) {
@@ -693,7 +742,7 @@ func quickRecheckWorker() {
 					} else if err != nil {
 						log.Printf("ERROR: QUICK RE-CHECK - TCIN %s (via %s): Error during check: %v", currentTCIN, quickRecheckMobileClient.GetProxy(), err)
 					}
-				}(tcinToRecheck, proxyToUse)
+				}(tcinToRecheck, proxyToUse, selectedStoreContext)
 			}
 			quickCheckWg.Wait()
 			log.Printf("QUICK RE-CHECK WORKER: Finished check for %d TCIN(s).", len(tcinsToActuallyRecheckThisIteration))
@@ -724,8 +773,19 @@ func generateRandomHexString(length int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// checkProductMobileAPIAndNotify updated to accept visitorID and userAgent
-func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, isQuickRecheck bool, visitorID string, userAgent string) error {
+// Helper function to generate a random numeric string of specified length
+func generateRandomNumericString(length int) string {
+	bytes := make([]byte, length)
+	for i := range bytes {
+		bytes[i] = byte(mrand.Intn(10) + '0') // Generate a digit '0'-'9'
+	}
+	return string(bytes)
+}
+
+// checkProductMobileAPIAndNotify updated for store context and dynamic IDs
+func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, isQuickRecheck bool,
+	visitorID string, userAgent string, loyaltyID string, memberID string,
+	storeID string, zipCode string, state string) error {
 	startTime := time.Now()
 	apiType := "Mobile API"
 	if isQuickRecheck {
@@ -733,16 +793,16 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 	}
 
 	pageParam := fmt.Sprintf("/pdplite/A-%s", tcin)
-	// Use passed-in visitorID in the URL
+	// Re-add store_id, zip, state, pricing_store_id, scheduled_delivery_store_id using passed-in context
 	requestURL := fmt.Sprintf("https://redsky.target.com/redsky_aggregations/v1/apps/pdp_lite_v1?channel=APPS&key=%s&pricing_store_id=%s&scheduled_delivery_store_id=%s&state=%s&store_id=%s&tcin=%s&visitor_id=%s&zip=%s&os_family=iOS&page=%s&app_version=%s",
 		url.QueryEscape(mobileAPIKey),
-		url.QueryEscape(mobileStoreID),
-		url.QueryEscape(mobileStoreID),
-		url.QueryEscape(mobileState),
-		url.QueryEscape(mobileStoreID),
+		url.QueryEscape(storeID), // Use passed-in storeID for pricing_store_id
+		url.QueryEscape(storeID), // Use passed-in storeID for scheduled_delivery_store_id
+		url.QueryEscape(state),   // Use passed-in state
+		url.QueryEscape(storeID), // Use passed-in storeID
 		url.QueryEscape(tcin),
-		url.QueryEscape(visitorID), // Use passed-in visitorID
-		url.QueryEscape(mobileZipCode),
+		url.QueryEscape(visitorID),
+		url.QueryEscape(zipCode), // Use passed-in zipCode
 		url.QueryEscape(pageParam),
 		url.QueryEscape(mobileAppVersion),
 	)
@@ -759,10 +819,10 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		log.Printf("WARN: TCIN %s (%s): Failed to generate traceparent: %v. Request will proceed with an empty traceparent.", tcin, apiType, errTrace)
 		newTraceparent = ""
 	}
-	newXRequestID := uuid.NewString() // Generate X-Request-ID per call
+	newXRequestID := uuid.NewString()
 
 	req.Header = http.Header{
-		"X-VISITOR-ID":      {visitorID}, // Use passed-in visitorID
+		"X-VISITOR-ID":      {visitorID},
 		"Accept":            {"application/json, text/plain, */*"},
 		"x-scr":             {"42d16a82"},
 		"X-CLIENT-VERSION":  {mobileAppVersion},
@@ -770,13 +830,13 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		"Accept-Language":   {"en-US,en;q=0.9"},
 		"X-CLIENT-PLATFORM": {"iPhone"},
 		"X-CHANNEL-ID":      {"APPS"},
-		// Update x-sapphire-context to use the dynamic visitorID
+		// Update x-sapphire-context to use dynamic IDs AND passed-in storeID
 		"x-sapphire-context": {fmt.Sprintf("app_name=Target&app_version=%s&base_membership=true&card_membership=true&channel=apps&device=iPhone15,3&in_store=false&loyalty_id=%s&member_id=%s&os_family=iOS&os_version=18.5&paid_membership=false&profile_created_date=2022-02-21T20:35:57.859Z&redcard_holder=true&source=flagship_ios&store_id=%s&tm=false&visitor_id=%s&wholeAppTest=true",
-			mobileAppVersion, mobileLoyaltyID, mobileMemberID, mobileStoreID, visitorID /* Use passed-in visitorID */)},
-		"X-REQUEST-ID":   {newXRequestID}, // Use dynamically generated X-Request-ID
-		"User-Agent":     {userAgent},     // Use passed-in userAgent
+			mobileAppVersion, loyaltyID, memberID, storeID, visitorID)},
+		"X-REQUEST-ID":   {newXRequestID},
+		"User-Agent":     {userAgent},
 		"X-DEVICE-ID":    {newDeviceID},
-		"X-DEVICE-MODEL": {"iPhone15,3"}, // This could also be varied with User-Agent if using a list of more diverse UAs
+		"X-DEVICE-MODEL": {"iPhone15,3"},
 		"traceparent":    {newTraceparent},
 		http.HeaderOrderKey: {
 			"X-VISITOR-ID", "Accept", "x-scr", "X-CLIENT-VERSION", "Accept-Encoding", "Accept-Language",
