@@ -64,7 +64,7 @@ var (
 	proxyTestURL      string
 
 	// List of TCINs to monitor
-	tcinsToMonitor = []string{"94300069", "94681785", "94636854", "94681770", "94636862", "94721086", "94636860", "94641043"} // Added TCIN from desktop example
+	tcinsToMonitor = []string{"94300069", "94681785", "94636854", "94681770", "94636862", "94721086", "94636860", "94641043", "94300072"} // Added TCIN from desktop example
 
 	// Store contexts to rotate through - UPDATED with user-provided data
 	storeContexts = []StoreContext{
@@ -421,55 +421,56 @@ func validateProxies(initialProxies []string) []string {
 // preFetchProductImages fetches and caches product image URLs at startup.
 func preFetchProductImages() {
 	if len(tcinsToMonitor) == 0 {
+		log.Println("INFO: No TCINs to monitor, skipping image pre-fetch.")
 		return
 	}
 	log.Printf("INFO: Starting pre-fetch of product images for %d TCINs...", len(tcinsToMonitor))
 
-	// Create a temporary client for this pre-fetching task
-	// It can use a generic desktop profile and a specific timeout for HTML scraping.
-	preFetchClientJar := tls_client.NewCookieJar()
-	preFetchClientOptions := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(productImagePrefetchTimeoutSeconds),
-		tls_client.WithClientProfile(profiles.Chrome_133), // Use a common desktop profile
-		tls_client.WithNotFollowRedirects(),
-		tls_client.WithCookieJar(preFetchClientJar),
-	}
-	preFetchClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), preFetchClientOptions...)
-	if err != nil {
-		log.Printf("ERROR: Failed to create client for product image pre-fetching: %v. Skipping pre-fetch.", err)
-		return
-	}
-
 	var wg sync.WaitGroup
-	// Create a copy of tcinsToMonitor to iterate over, in case the global one changes (though not currently a feature)
 	tcinsSnapshot := make([]string, len(tcinsToMonitor))
 	copy(tcinsSnapshot, tcinsToMonitor)
 
-	// Create a copy of proxies to use for pre-fetching to avoid interfering with main loop's shuffling index
 	localProxiesForPrefetch := make([]string, len(loadedProxies))
+	copiedProxies := false
 	if len(loadedProxies) > 0 {
 		copy(localProxiesForPrefetch, loadedProxies)
-		shuffleProxies(localProxiesForPrefetch) // Shuffle once for this entire pre-fetch batch
+		shuffleProxies(localProxiesForPrefetch)
+		copiedProxies = true
 	}
-	prefetchProxyIndex := 0
 
 	for i, tcin := range tcinsSnapshot {
 		wg.Add(1)
-		go func(idx int, currentTCIN string) {
-			defer wg.Done()
-			var fetchedImageURL string
 
-			if len(localProxiesForPrefetch) > 0 {
-				proxyToUse := localProxiesForPrefetch[prefetchProxyIndex%len(localProxiesForPrefetch)]
-				// This simple round-robin for prefetchProxyIndex is not thread-safe if prefetch goroutines were very fast
-				// relative to a large number of TCINs. For a one-off startup task with a WaitGroup, it's mostly fine.
-				// A channel or atomic counter for proxy dispensing would be more robust for general concurrent use.
-				// For simplicity here, this basic rotation within the pre-fetch batch will be used.
-				// Each goroutine will effectively get a different proxy if num TCINs <= num Proxies.
-				// More accurately, let each goroutine pick its proxy based on its loop index `idx`
-				proxyToUse = localProxiesForPrefetch[idx%len(localProxiesForPrefetch)]
+		proxyToUseForThisPrefetch := ""
+		if copiedProxies && len(localProxiesForPrefetch) > 0 {
+			proxyToUseForThisPrefetch = localProxiesForPrefetch[i%len(localProxiesForPrefetch)]
+		}
+
+		go func(currentTCIN string, proxyToUse string) {
+			defer wg.Done()
+			var fetchedImageURL string // Default to empty
+
+			// Create a new, short-lived client for each pre-fetch goroutine for proxy isolation
+			preFetchClientJar := tls_client.NewCookieJar()
+			preFetchClientOptions := []tls_client.HttpClientOption{
+				tls_client.WithTimeoutSeconds(productImagePrefetchTimeoutSeconds),
+				tls_client.WithClientProfile(profiles.Chrome_133),
+				tls_client.WithNotFollowRedirects(),
+				tls_client.WithCookieJar(preFetchClientJar),
+			}
+			preFetchClient, clientErr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), preFetchClientOptions...)
+			if clientErr != nil {
+				log.Printf("WARN: Pre-fetch TCIN %s - Failed to create temp pre-fetch client: %v", currentTCIN, clientErr)
+				productImageCacheMutex.Lock()
+				productImageCache[currentTCIN] = "" // Cache failure
+				productImageCacheMutex.Unlock()
+				return
+			}
+
+			if proxyToUse != "" {
 				if err := preFetchClient.SetProxy(proxyToUse); err != nil {
-					log.Printf("WARN: Pre-fetch TCIN %s - Failed to set proxy %s: %v", currentTCIN, proxyToUse, err)
+					log.Printf("WARN: Pre-fetch TCIN %s - Failed to set proxy %s: %v. Proceeding without proxy for this attempt.", currentTCIN, proxyToUse, err)
+					// If proxy setting fails, preFetchClient will make a direct request.
 				}
 			}
 
@@ -519,15 +520,21 @@ func preFetchProductImages() {
 			}
 
 			productImageCacheMutex.Lock()
-			productImageCache[currentTCIN] = fetchedImageURL // Cache even if empty (failure)
+			productImageCache[currentTCIN] = fetchedImageURL
 			productImageCacheMutex.Unlock()
-		}(i, tcin)
+		}(tcin, proxyToUseForThisPrefetch)
 	}
 	wg.Wait()
 	log.Println("INFO: Product image pre-fetching attempts complete.")
 }
 
 func main() {
+	mrand.Seed(time.Now().UnixNano())
+	lastNotificationSent = make(map[string]time.Time)
+	lastKnownStockState = make(map[string]bool)
+	quickRecheckCounters = make(map[string]int)
+	productImageCache = make(map[string]string)
+
 	errEnv := godotenv.Load()
 	if errEnv != nil {
 		if !os.IsNotExist(errEnv) {
@@ -537,7 +544,6 @@ func main() {
 		}
 	}
 
-	// Initialize configuration variables from environment or defaults
 	discordWebhookURL = getEnv("DISCORD_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE")
 	proxyFilePath = getEnv("PROXY_FILE_PATH", "proxies.txt")
 	proxyTestURL = getEnv("PROXY_TEST_URL", "https://api.ipify.org?format=json")
@@ -546,16 +552,11 @@ func main() {
 		log.Println("WARN: DISCORD_WEBHOOK_URL is not set or is using the default placeholder. Notifications will likely fail.")
 	}
 
-	lastNotificationSent = make(map[string]time.Time)
-	lastKnownStockState = make(map[string]bool)
-	quickRecheckCounters = make(map[string]int)
-	productImageCache = make(map[string]string)
-
-	var err error // General error variable for use in main
+	var err error
 	estLocation, err = time.LoadLocation("America/New_York")
 	if err != nil {
 		log.Printf("WARN: Could not load America/New_York timezone: %v. Footer timestamps will use system's local time.", err)
-		estLocation = time.Local // Fallback to local if specific zone fails
+		estLocation = time.Local
 	}
 
 	log.Println("Target Product Monitor started.")
@@ -575,10 +576,7 @@ func main() {
 		}
 	}
 
-	// Launch pre-fetch for product images as a goroutine so it doesn't block startup
-	go preFetchProductImages()
-
-	// Initialize Quick Re-check Clients (one mobile, one desktop for HTML scraping)
+	// Initialize Quick Re-check Clients (as before)
 	quickRecheckJarMobile := tls_client.NewCookieJar()
 	quickRecheckOptionsMobile := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(15),
@@ -586,68 +584,85 @@ func main() {
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(quickRecheckJarMobile),
 	}
-	var errQuickClientInit error
-	quickRecheckMobileClient, errQuickClientInit = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsMobile...)
-	if errQuickClientInit != nil {
-		log.Fatalf("Failed to create Quick Re-check Mobile TLS client: %v", errQuickClientInit)
+	quickRecheckMobileClient, err = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsMobile...)
+	if err != nil {
+		log.Fatalf("Failed to create Quick Re-check Mobile TLS client: %v", err)
 	}
-
 	quickRecheckJarDesktop := tls_client.NewCookieJar()
 	quickRecheckOptionsDesktop := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(20),                 // HTML pages can be larger
-		tls_client.WithClientProfile(profiles.Chrome_133), // Use a desktop Chrome profile
+		tls_client.WithTimeoutSeconds(20),
+		tls_client.WithClientProfile(profiles.Chrome_133),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(quickRecheckJarDesktop),
 	}
-	quickRecheckDesktopClient, errQuickClientInit = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsDesktop...)
-	if errQuickClientInit != nil {
-		log.Fatalf("Failed to create Quick Re-check Desktop TLS client: %v", errQuickClientInit)
+	quickRecheckDesktopClient, err = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsDesktop...)
+	if err != nil {
+		log.Fatalf("Failed to create Quick Re-check Desktop TLS client: %v", err)
 	}
+	log.Println("Quick Re-check clients initialized.")
 
-	go quickRecheckWorker()
+	// --- Pre-fetch Product Images (Synchronously from main goroutine's perspective) ---
+	if len(tcinsToMonitor) > 0 {
+		log.Println("MAIN: Starting product image pre-fetching...")
+		preFetchProductImages() // Call directly. This function uses its own WaitGroup for internal concurrency.
+		log.Println("MAIN: Product image pre-fetching complete. Starting monitoring workers.")
+	} else {
+		log.Println("MAIN: No TCINs to monitor, skipping image pre-fetch.")
+	}
+	// --- End Pre-fetch ---
+
+	go quickRecheckWorker() // Start the quick re-check worker (can start after image prefetch or concurrently, it has its own dependencies)
 
 	log.Printf("Initializing %d main monitoring workers...", numMonitoringWorkers)
 	staggerDelay := time.Duration(0)
 	if numMonitoringWorkers > 0 && len(storeContexts) > 0 {
-		// Stagger based on number of workers OR number of store contexts, whichever provides finer grained staggering
-		staggerDivisor := numMonitoringWorkers
-		// If we want each worker to start on a new store context (round robin), stagger by store contexts if more numerous
-		// For now, simple stagger by worker count
-		staggerDelay = (time.Duration(checkIntervalSeconds) * time.Second) / time.Duration(staggerDivisor)
+		staggerDelay = (time.Duration(checkIntervalSeconds) * time.Second) / time.Duration(numMonitoringWorkers)
 	} else if numMonitoringWorkers > 0 {
 		staggerDelay = (time.Duration(checkIntervalSeconds) * time.Second) / time.Duration(numMonitoringWorkers)
 	}
 
 	for workerID := 0; workerID < numMonitoringWorkers; workerID++ {
-		// Each worker gets its own mobile client instance for API calls
+		// Construct the initial profiles.ClientProfile for this worker
+		initialProfileForWorker := profiles.NewClientProfile(
+			mainClientInitialProfile, // This is utls.ClientHelloID
+			profiles.DefaultClientProfile.GetSettings(),
+			profiles.DefaultClientProfile.GetSettingsOrder(),
+			profiles.DefaultClientProfile.GetPseudoHeaderOrder(),
+			profiles.DefaultClientProfile.GetConnectionFlow(),
+			nil,
+			nil,
+		)
+
 		workerMobileJar := tls_client.NewCookieJar()
 		workerMobileOptions := []tls_client.HttpClientOption{
 			tls_client.WithTimeoutSeconds(30),
-			tls_client.WithClientProfile(profiles.Safari_IOS_18_5), // Default starting profile
+			tls_client.WithClientProfile(initialProfileForWorker), // Use the constructed profiles.ClientProfile
 			tls_client.WithNotFollowRedirects(),
 			tls_client.WithCookieJar(workerMobileJar),
 		}
-		workerMobileAPIClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerMobileOptions...)
-		if err != nil {
-			log.Fatalf("WORKER %d: Failed to create Main Mobile API TLS client: %v", workerID, err)
+		workerMobileAPIClient, workerErr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerMobileOptions...)
+		if workerErr != nil {
+			log.Fatalf("WORKER %d: Failed to create Main Mobile API TLS client: %v", workerID, workerErr)
 		}
-		log.Printf("WORKER %d: Main Mobile API client initialized.", workerID)
+		log.Printf("WORKER %d: Main Mobile API client initialized with profile based on HelloID: %s", workerID, mainClientInitialProfile.Str())
 
-		// Each worker also gets its own desktop client instance for HTML scraping
 		workerDesktopJar := tls_client.NewCookieJar()
 		workerDesktopOptions := []tls_client.HttpClientOption{
-			tls_client.WithTimeoutSeconds(20),                 // Timeout for HTML page fetch
-			tls_client.WithClientProfile(profiles.Chrome_133), // Desktop Chrome profile
+			tls_client.WithTimeoutSeconds(productImagePrefetchTimeoutSeconds),
+			tls_client.WithClientProfile(profiles.Chrome_133),
 			tls_client.WithNotFollowRedirects(),
 			tls_client.WithCookieJar(workerDesktopJar),
 		}
-		workerHTMLClient, errDesktop := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerDesktopOptions...)
-		if errDesktop != nil {
-			log.Fatalf("WORKER %d: Failed to create Desktop HTML TLS client: %v", workerID, errDesktop)
+		workerHTMLClient, workerErrDesktop := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerDesktopOptions...)
+		if workerErrDesktop != nil {
+			log.Fatalf("WORKER %d: Failed to create Desktop HTML TLS client: %v", workerID, workerErrDesktop)
 		}
 		log.Printf("WORKER %d: Desktop HTML client initialized.", workerID)
 
-		initialStoreContextIndex := uint64(workerID % len(storeContexts))
+		initialStoreContextIndex := uint64(0)
+		if len(storeContexts) > 0 {
+			initialStoreContextIndex = uint64(workerID % len(storeContexts))
+		}
 		go monitoringWorker(workerID, workerMobileAPIClient, workerHTMLClient, initialStoreContextIndex)
 		if workerID < numMonitoringWorkers-1 && staggerDelay > 0 {
 			time.Sleep(staggerDelay)
@@ -1135,7 +1150,6 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 		{Name: "Available Quantity", Value: fmt.Sprintf("%.0f", availableQuantity), Inline: false},
 	}
 
-	// Construct the correct product URL for the embed title's link
 	correctProductURL := fmt.Sprintf("https://www.target.com/p/-/A-%s", tcin)
 
 	embed := DiscordEmbed{
@@ -1155,6 +1169,10 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 			IconURL: discordEmbedImageURL,
 		},
 	}
+
+	// --- DEBUG LOG FOR IMAGE URL ---
+	log.Printf("DEBUG: Sending to Discord - Embed Image URL: '%s', Thumbnail URL: '%s'", embed.Image.URL, embed.Thumbnail.URL)
+	// --- END DEBUG LOG ---
 
 	message := DiscordMessage{
 		Content:  messageContent,
