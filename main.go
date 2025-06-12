@@ -1048,23 +1048,29 @@ func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeC
 	}
 
 	coloredShippingStatus := shippingStatus
-	if strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0 {
+	// Determine actual in-stock status more strictly
+	isActuallyInStockForShipping := strings.ToUpper(shippingStatus) == "IN_STOCK"
+
+	if isActuallyInStockForShipping {
 		coloredShippingStatus = colorGreen + shippingStatus + colorReset
-	} else if strings.Contains(strings.ToUpper(shippingStatus), "OUT_OF_STOCK") || strings.Contains(strings.ToUpper(shippingStatus), "UNAVAILABLE") {
+	} else if strings.Contains(strings.ToUpper(shippingStatus), "OUT_OF_STOCK") ||
+		strings.Contains(strings.ToUpper(shippingStatus), "UNAVAILABLE") ||
+		strings.Contains(strings.ToUpper(shippingStatus), "PRE_ORDER_UNSELLABLE") { // Explicitly color PRE_ORDER_UNSELLABLE as red
 		coloredShippingStatus = colorRed + shippingStatus + colorReset
-	}
+	} // Other statuses will remain default color
 
 	log.Printf("TCIN %s: '%s' - Price: %s, Shipping Status: %s, Qty: %.0f",
 		product.TCIN, cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty)
 
-	isInStock := strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0
+	// Use the stricter in-stock definition for notifications and state
+	isInStock := isActuallyInStockForShipping
 
 	stateMutex.Lock()
 	previousState, stateKnown := lastKnownStockState[tcin]
-	lastKnownStockState[tcin] = isInStock
+	lastKnownStockState[tcin] = isInStock // Update state based on isActuallyInStockForShipping
 	stateMutex.Unlock()
 
-	if isInStock {
+	if isInStock { // This now correctly reflects only if status was truly "IN_STOCK"
 		lastNotificationMutex.Lock()
 		lastSentTime, found := lastNotificationSent[tcin]
 		cooldownDuration := time.Duration(notificationCooldownMinutes) * time.Minute
@@ -1088,15 +1094,17 @@ func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeC
 		recheckMutex.Lock()
 		if _, ok := quickRecheckCounters[tcin]; ok {
 			delete(quickRecheckCounters, tcin)
+			log.Printf("TCIN %s: Item is IN_STOCK. Quick re-check schedule cleared.", product.TCIN)
 		}
 		recheckMutex.Unlock()
 
-	} else {
-		log.Printf("TCIN %s: %sOUT OF STOCK%s. Title: %s",
-			product.TCIN, colorRed, colorReset, cleanedTitle)
-		if !isQuickRecheck && (!stateKnown || previousState) {
+	} else { // Item is effectively OUT_OF_STOCK for notification purposes (includes PRE_ORDER_UNSELLABLE, etc.)
+		log.Printf("TCIN %s: %s%s%s. Title: %s", // Use the coloredShippingStatus for the log
+			product.TCIN, colorRed, shippingStatus, colorReset, cleanedTitle)
+		if !isQuickRecheck && (!stateKnown || previousState) { // If it just transitioned to OOS or was unknown and is OOS
 			recheckMutex.Lock()
 			quickRecheckCounters[tcin] = quickRecheckCount
+			log.Printf("TCIN %s: Item is effectively OUT OF STOCK (status: %s). Scheduled %d quick re-checks.", product.TCIN, shippingStatus, quickRecheckCount)
 			recheckMutex.Unlock()
 		}
 	}
