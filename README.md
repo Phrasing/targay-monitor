@@ -1,3 +1,2 @@
-# targay-monitor
-
-good vibes only
+### Product monitor for target.com
+made with vibes only
