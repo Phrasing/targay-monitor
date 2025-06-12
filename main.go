@@ -15,6 +15,7 @@ import (
 	standard_http "net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,7 @@ const (
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	// colorBlue   = "\033[34m" // Example, add if needed
+	productImagePrefetchTimeoutSeconds = 20 // Timeout for pre-fetching individual product page HTML
 )
 
 // --- Configuration Variables (to be loaded from .env or defaults) ---
@@ -140,6 +142,9 @@ var (
 		fmt.Sprintf("Target/%s iPad13,10 iOS/18.5 CFNetwork/3826.500.131 Darwin/24.5.0", mobileAppVersion),
 		fmt.Sprintf("Target/%s iPad13,16 iOS/18.4 CFNetwork/3820.200.112 Darwin/24.4.0", mobileAppVersion),
 	}
+
+	// No separate global desktopClient needed if each worker gets one, or if quickRecheck uses its own.
+	quickRecheckDesktopClient tls_client.HttpClient // For quick recheck HTML scraping
 )
 
 // StoreContext holds StoreID, ZipCode, and State for API requests
@@ -413,6 +418,115 @@ func validateProxies(initialProxies []string) []string {
 	return finalGoodProxies
 }
 
+// preFetchProductImages fetches and caches product image URLs at startup.
+func preFetchProductImages() {
+	if len(tcinsToMonitor) == 0 {
+		return
+	}
+	log.Printf("INFO: Starting pre-fetch of product images for %d TCINs...", len(tcinsToMonitor))
+
+	// Create a temporary client for this pre-fetching task
+	// It can use a generic desktop profile and a specific timeout for HTML scraping.
+	preFetchClientJar := tls_client.NewCookieJar()
+	preFetchClientOptions := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(productImagePrefetchTimeoutSeconds),
+		tls_client.WithClientProfile(profiles.Chrome_133), // Use a common desktop profile
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithCookieJar(preFetchClientJar),
+	}
+	preFetchClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), preFetchClientOptions...)
+	if err != nil {
+		log.Printf("ERROR: Failed to create client for product image pre-fetching: %v. Skipping pre-fetch.", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	// Create a copy of tcinsToMonitor to iterate over, in case the global one changes (though not currently a feature)
+	tcinsSnapshot := make([]string, len(tcinsToMonitor))
+	copy(tcinsSnapshot, tcinsToMonitor)
+
+	// Create a copy of proxies to use for pre-fetching to avoid interfering with main loop's shuffling index
+	localProxiesForPrefetch := make([]string, len(loadedProxies))
+	if len(loadedProxies) > 0 {
+		copy(localProxiesForPrefetch, loadedProxies)
+		shuffleProxies(localProxiesForPrefetch) // Shuffle once for this entire pre-fetch batch
+	}
+	prefetchProxyIndex := 0
+
+	for i, tcin := range tcinsSnapshot {
+		wg.Add(1)
+		go func(idx int, currentTCIN string) {
+			defer wg.Done()
+			var fetchedImageURL string
+
+			if len(localProxiesForPrefetch) > 0 {
+				proxyToUse := localProxiesForPrefetch[prefetchProxyIndex%len(localProxiesForPrefetch)]
+				// This simple round-robin for prefetchProxyIndex is not thread-safe if prefetch goroutines were very fast
+				// relative to a large number of TCINs. For a one-off startup task with a WaitGroup, it's mostly fine.
+				// A channel or atomic counter for proxy dispensing would be more robust for general concurrent use.
+				// For simplicity here, this basic rotation within the pre-fetch batch will be used.
+				// Each goroutine will effectively get a different proxy if num TCINs <= num Proxies.
+				// More accurately, let each goroutine pick its proxy based on its loop index `idx`
+				proxyToUse = localProxiesForPrefetch[idx%len(localProxiesForPrefetch)]
+				if err := preFetchClient.SetProxy(proxyToUse); err != nil {
+					log.Printf("WARN: Pre-fetch TCIN %s - Failed to set proxy %s: %v", currentTCIN, proxyToUse, err)
+				}
+			}
+
+			productPageURL := fmt.Sprintf("https://www.target.com/p/-/A-%s", currentTCIN)
+			pageReq, pageErr := http.NewRequest("GET", productPageURL, nil)
+			if pageErr == nil {
+				pageReq.Header = http.Header{
+					"Accept":                    {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
+					"Accept-Language":           {"en-US,en;q=0.9"},
+					"Cache-Control":             {"no-cache"},
+					"Pragma":                    {"no-cache"},
+					"Priority":                  {"u=0, i"},
+					"Sec-Fetch-Dest":            {"document"},
+					"Sec-Fetch-Mode":            {"navigate"},
+					"Sec-Fetch-Site":            {"none"},
+					"Sec-Fetch-User":            {"?1"},
+					"Sec-GPC":                   {"1"},
+					"Upgrade-Insecure-Requests": {"1"},
+					"User-Agent":                {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
+				}
+				pageResp, pageRespErr := preFetchClient.Do(pageReq)
+				if pageRespErr == nil {
+					defer pageResp.Body.Close()
+					if pageResp.StatusCode == standard_http.StatusOK {
+						htmlBody, readErr := io.ReadAll(pageResp.Body)
+						if readErr == nil {
+							re := regexp.MustCompile(`https://target\.scene7\.com/is/image/Target/[A-Za-z0-9_-]+`)
+							foundBaseImageURL := re.FindString(string(htmlBody))
+							if foundBaseImageURL != "" {
+								fetchedImageURL = fmt.Sprintf("%s?format=%s&width=%d&height=%d",
+									foundBaseImageURL, productThumbnailFormat, productThumbnailWidth, productThumbnailHeight)
+								log.Printf("INFO: Pre-fetch TCIN %s - Found image URL: %s", currentTCIN, fetchedImageURL)
+							} else {
+								log.Printf("WARN: Pre-fetch TCIN %s - Product image URL pattern not found in HTML from %s.", currentTCIN, productPageURL)
+							}
+						} else {
+							log.Printf("WARN: Pre-fetch TCIN %s - Failed to read page body from %s: %v", currentTCIN, productPageURL, readErr)
+						}
+					} else {
+						log.Printf("WARN: Pre-fetch TCIN %s - Page request to %s returned status %d", currentTCIN, productPageURL, pageResp.StatusCode)
+					}
+				} else {
+					log.Printf("WARN: Pre-fetch TCIN %s - Failed to fetch page %s: %v", currentTCIN, productPageURL, pageRespErr)
+				}
+			} else {
+				log.Printf("WARN: Pre-fetch TCIN %s - Failed to create request for page %s: %v", currentTCIN, productPageURL, pageErr)
+			}
+
+			productImageCacheMutex.Lock()
+			productImageCache[currentTCIN] = fetchedImageURL // Cache even if empty (failure)
+			productImageCacheMutex.Unlock()
+		}(i, tcin)
+	}
+	wg.Wait()
+	log.Println("INFO: Product image pre-fetching attempts complete.")
+}
+
 func main() {
 	errEnv := godotenv.Load()
 	if errEnv != nil {
@@ -461,19 +575,34 @@ func main() {
 		}
 	}
 
-	quickRecheckJar := tls_client.NewCookieJar()
-	quickRecheckOptions := []tls_client.HttpClientOption{
+	// Launch pre-fetch for product images as a goroutine so it doesn't block startup
+	go preFetchProductImages()
+
+	// Initialize Quick Re-check Clients (one mobile, one desktop for HTML scraping)
+	quickRecheckJarMobile := tls_client.NewCookieJar()
+	quickRecheckOptionsMobile := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(15),
 		tls_client.WithClientProfile(profiles.Safari_IOS_18_5),
 		tls_client.WithNotFollowRedirects(),
-		tls_client.WithCookieJar(quickRecheckJar),
+		tls_client.WithCookieJar(quickRecheckJarMobile),
 	}
-	// Use general 'err' for this client init, assuming no conflict with estLocation error handling above.
-	quickRecheckMobileClient, err = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptions...)
-	if err != nil {
-		log.Fatalf("Failed to create Quick Re-check Mobile TLS client: %v", err)
+	var errQuickClientInit error
+	quickRecheckMobileClient, errQuickClientInit = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsMobile...)
+	if errQuickClientInit != nil {
+		log.Fatalf("Failed to create Quick Re-check Mobile TLS client: %v", errQuickClientInit)
 	}
-	log.Println("Quick Re-check Mobile API client initialized.")
+
+	quickRecheckJarDesktop := tls_client.NewCookieJar()
+	quickRecheckOptionsDesktop := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(20),                 // HTML pages can be larger
+		tls_client.WithClientProfile(profiles.Chrome_133), // Use a desktop Chrome profile
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithCookieJar(quickRecheckJarDesktop),
+	}
+	quickRecheckDesktopClient, errQuickClientInit = tls_client.NewHttpClient(tls_client.NewNoopLogger(), quickRecheckOptionsDesktop...)
+	if errQuickClientInit != nil {
+		log.Fatalf("Failed to create Quick Re-check Desktop TLS client: %v", errQuickClientInit)
+	}
 
 	go quickRecheckWorker()
 
@@ -490,22 +619,36 @@ func main() {
 	}
 
 	for workerID := 0; workerID < numMonitoringWorkers; workerID++ {
+		// Each worker gets its own mobile client instance for API calls
 		workerMobileJar := tls_client.NewCookieJar()
 		workerMobileOptions := []tls_client.HttpClientOption{
 			tls_client.WithTimeoutSeconds(30),
-			tls_client.WithClientProfile(profiles.Safari_IOS_18_5),
+			tls_client.WithClientProfile(profiles.Safari_IOS_18_5), // Default starting profile
 			tls_client.WithNotFollowRedirects(),
 			tls_client.WithCookieJar(workerMobileJar),
 		}
-		// Use general 'err' for this client init too.
-		workerClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerMobileOptions...)
+		workerMobileAPIClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerMobileOptions...)
 		if err != nil {
-			log.Fatalf("WORKER %d: Failed to create Main Mobile TLS client: %v", workerID, err)
+			log.Fatalf("WORKER %d: Failed to create Main Mobile API TLS client: %v", workerID, err)
 		}
 		log.Printf("WORKER %d: Main Mobile API client initialized.", workerID)
-		// Each worker gets its initial store context index offset by its ID to try and start them on different stores
-		initialStoreContextIndex := uint64(workerID % len(storeContexts)) // Ensure this doesn't panic if storeContexts is empty (checked above for staggerDelay)
-		go monitoringWorker(workerID, workerClient, initialStoreContextIndex)
+
+		// Each worker also gets its own desktop client instance for HTML scraping
+		workerDesktopJar := tls_client.NewCookieJar()
+		workerDesktopOptions := []tls_client.HttpClientOption{
+			tls_client.WithTimeoutSeconds(20),                 // Timeout for HTML page fetch
+			tls_client.WithClientProfile(profiles.Chrome_133), // Desktop Chrome profile
+			tls_client.WithNotFollowRedirects(),
+			tls_client.WithCookieJar(workerDesktopJar),
+		}
+		workerHTMLClient, errDesktop := tls_client.NewHttpClient(tls_client.NewNoopLogger(), workerDesktopOptions...)
+		if errDesktop != nil {
+			log.Fatalf("WORKER %d: Failed to create Desktop HTML TLS client: %v", workerID, errDesktop)
+		}
+		log.Printf("WORKER %d: Desktop HTML client initialized.", workerID)
+
+		initialStoreContextIndex := uint64(workerID % len(storeContexts))
+		go monitoringWorker(workerID, workerMobileAPIClient, workerHTMLClient, initialStoreContextIndex)
 		if workerID < numMonitoringWorkers-1 && staggerDelay > 0 {
 			time.Sleep(staggerDelay)
 		}
@@ -515,9 +658,9 @@ func main() {
 	select {}
 }
 
-func monitoringWorker(workerID int, initialClient tls_client.HttpClient, initialStoreContextIdx uint64) {
+func monitoringWorker(workerID int, mobileAPIClient tls_client.HttpClient, htmlScrapeClient tls_client.HttpClient, initialStoreContextIdx uint64) {
 	log.Printf("WORKER %d: Started.", workerID)
-	client := initialClient // Use the client passed in, allow it to be replaced
+	client := mobileAPIClient // client for API calls
 	var currentWorkerProxyIndex uint64
 	var currentBackoffDuration time.Duration
 	var consecutiveBadCycles int
@@ -546,9 +689,6 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient, initial
 			log.Printf("WORKER %d: Backoff complete. Resuming normal cycle.", workerID)
 		}
 
-		log.Printf("WORKER %d: Starting new check cycle using StoreID: %s, Zip: %s, State: %s.",
-			workerID, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].StoreID, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].ZipCode, storeContexts[currentStoreCtxIndex%uint64(len(storeContexts))].State)
-
 		workerProxies := make([]string, len(loadedProxies))
 		copied := false
 		if len(loadedProxies) > 0 {
@@ -571,12 +711,16 @@ func monitoringWorker(workerID int, initialClient tls_client.HttpClient, initial
 			go func(currentTCIN string, currentProxy string, sc StoreContext) {
 				defer workerCycleWg.Done()
 				if currentProxy != "" {
-					if err := client.SetProxy(currentProxy); err != nil {
-						log.Printf("WARN: WORKER %d - TCIN %s: Failed to set proxy %s: %v.", workerID, currentTCIN, currentProxy, err)
+					if err := client.SetProxy(currentProxy); err != nil { // Set proxy on mobileAPIClient
+						log.Printf("WARN: WORKER %d - TCIN %s: Failed to set proxy %s for Mobile API Client: %v.", workerID, currentTCIN, currentProxy, err)
+					}
+					// Also set proxy for the HTML scrape client for this TCIN check
+					if err := htmlScrapeClient.SetProxy(currentProxy); err != nil {
+						log.Printf("WARN: WORKER %d - TCIN %s: Failed to set proxy %s for HTML Scrape Client: %v.", workerID, currentTCIN, currentProxy, err)
 					}
 				}
-				// Pass worker-specific identifiers AND current store context
-				err := checkProductMobileAPIAndNotify(client, currentTCIN, false,
+				// Pass htmlScrapeClient to checkProductMobileAPIAndNotify
+				err := checkProductMobileAPIAndNotify(client, htmlScrapeClient, currentTCIN, false,
 					workerVisitorID, workerUserAgent, workerLoyaltyID, workerMemberID,
 					sc.StoreID, sc.ZipCode, sc.State)
 				if errors.Is(err, ErrRateLimited) || errors.Is(err, ErrNotFound) {
@@ -677,7 +821,6 @@ func quickRecheckWorker() {
 				tcinsToActuallyRecheckThisIteration = append(tcinsToActuallyRecheckThisIteration, tcin)
 				quickRecheckCounters[tcin] = count - 1
 				if quickRecheckCounters[tcin] == 0 {
-					log.Printf("QUICK RE-CHECK WORKER: TCIN %s - Quick re-checks complete.", tcin)
 					delete(quickRecheckCounters, tcin)
 				}
 			}
@@ -685,7 +828,6 @@ func quickRecheckWorker() {
 		recheckMutex.Unlock()
 
 		if len(tcinsToActuallyRecheckThisIteration) > 0 {
-			log.Printf("QUICK RE-CHECK WORKER: Checking %d TCIN(s): %v", len(tcinsToActuallyRecheckThisIteration), tcinsToActuallyRecheckThisIteration)
 			workerQuickRecheckProxies := make([]string, len(loadedProxies))
 			copied := false
 			if len(loadedProxies) > 0 {
@@ -699,9 +841,7 @@ func quickRecheckWorker() {
 			var selectedStoreContext StoreContext
 			if len(storeContexts) > 0 {
 				selectedStoreContext = storeContexts[mrand.Intn(len(storeContexts))]
-				log.Printf("QUICK RE-CHECK WORKER: Using StoreContext: ID %s, Zip %s for this batch.", selectedStoreContext.StoreID, selectedStoreContext.ZipCode)
 			} else {
-				log.Printf("WARN: QUICK RE-CHECK WORKER: No store contexts available. This might lead to errors.")
 				// Fallback to default if no store contexts - this requires defaultStoreID etc. to be defined
 				selectedStoreContext = StoreContext{StoreID: defaultMobileStoreID, ZipCode: "00000", State: "XX"} // Placeholder
 			}
@@ -718,16 +858,20 @@ func quickRecheckWorker() {
 					defer quickCheckWg.Done()
 					if currentProxy != "" {
 						if err := quickRecheckMobileClient.SetProxy(currentProxy); err != nil {
-							log.Printf("WARN: QUICK RE-CHECK - TCIN %s: Failed to set proxy %s: %v.", currentTCIN, currentProxy, err)
+							log.Printf("WARN: QUICK RE-CHECK - TCIN %s: Failed to set proxy %s for Mobile Client: %v.", currentTCIN, currentProxy, err)
+						}
+						// Also set for the desktop client used by quick rechecks for HTML scraping
+						if err := quickRecheckDesktopClient.SetProxy(currentProxy); err != nil {
+							log.Printf("WARN: QUICK RE-CHECK - TCIN %s: Failed to set proxy %s for Desktop HTML Client: %v.", currentTCIN, currentProxy, err)
 						}
 					}
-					// Generate fresh identifiers for each quick re-check call for max variability
 					quickVisitorID, _ := generateRandomHexString(32)
+					quickUserAgent := validIOSUserAgents[mrand.Intn(len(validIOSUserAgents))]
 					randomHexForLoyalty, _ := generateRandomHexString(32)
 					quickLoyaltyID := "tly." + randomHexForLoyalty
 					quickMemberID := generateRandomNumericString(10)
-					quickUserAgent := validIOSUserAgents[mrand.Intn(len(validIOSUserAgents))]
-					err := checkProductMobileAPIAndNotify(quickRecheckMobileClient, currentTCIN, true,
+					// Pass quickRecheckDesktopClient for HTML scraping
+					err := checkProductMobileAPIAndNotify(quickRecheckMobileClient, quickRecheckDesktopClient, currentTCIN, true,
 						quickVisitorID, quickUserAgent, quickLoyaltyID, quickMemberID,
 						sc.StoreID, sc.ZipCode, sc.State)
 					if errors.Is(err, ErrRateLimited) {
@@ -744,7 +888,6 @@ func quickRecheckWorker() {
 				}(tcinToRecheck, proxyToUse, selectedStoreContext)
 			}
 			quickCheckWg.Wait()
-			log.Printf("QUICK RE-CHECK WORKER: Finished check for %d TCIN(s).", len(tcinsToActuallyRecheckThisIteration))
 		}
 	}
 }
@@ -781,45 +924,35 @@ func generateRandomNumericString(length int) string {
 	return string(bytes)
 }
 
-// checkProductMobileAPIAndNotify updated for store context and dynamic IDs
-func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, isQuickRecheck bool,
-	visitorID string, userAgent string, loyaltyID string, memberID string,
+// checkProductMobileAPIAndNotify is the core function for checking a single product.
+func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeClient tls_client.HttpClient,
+	tcin string, isQuickRecheck bool, visitorID string, userAgent string, loyaltyID string, memberID string,
 	storeID string, zipCode string, state string) error {
-	startTime := time.Now()
-	apiType := "Mobile API"
-	if isQuickRecheck {
-		apiType = "Mobile API (Quick Re-check)"
-	}
+
+	//startTime := time.Now()
 
 	pageParam := fmt.Sprintf("/pdplite/A-%s", tcin)
-	// Re-add store_id, zip, state, pricing_store_id, scheduled_delivery_store_id using passed-in context
 	requestURL := fmt.Sprintf("https://redsky.target.com/redsky_aggregations/v1/apps/pdp_lite_v1?channel=APPS&key=%s&pricing_store_id=%s&scheduled_delivery_store_id=%s&state=%s&store_id=%s&tcin=%s&visitor_id=%s&zip=%s&os_family=iOS&page=%s&app_version=%s",
 		url.QueryEscape(mobileAPIKey),
-		url.QueryEscape(storeID), // Use passed-in storeID for pricing_store_id
-		url.QueryEscape(storeID), // Use passed-in storeID for scheduled_delivery_store_id
-		url.QueryEscape(state),   // Use passed-in state
-		url.QueryEscape(storeID), // Use passed-in storeID
+		url.QueryEscape(storeID),
+		url.QueryEscape(storeID),
+		url.QueryEscape(state),
+		url.QueryEscape(storeID),
 		url.QueryEscape(tcin),
 		url.QueryEscape(visitorID),
-		url.QueryEscape(zipCode), // Use passed-in zipCode
+		url.QueryEscape(zipCode),
 		url.QueryEscape(pageParam),
 		url.QueryEscape(mobileAppVersion),
 	)
 
 	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
 	if err != nil {
-		log.Printf("TCIN %s (%s): Failed to create request: %v", tcin, apiType, err)
+		log.Printf("TCIN %s: Failed to create API request: %v", tcin, err)
 		return err
 	}
-
 	newDeviceID := uuid.NewString()
-	newTraceparent, errTrace := generateTraceparentString()
-	if errTrace != nil {
-		log.Printf("WARN: TCIN %s (%s): Failed to generate traceparent: %v. Request will proceed with an empty traceparent.", tcin, apiType, errTrace)
-		newTraceparent = ""
-	}
+	newTraceparent, _ := generateTraceparentString()
 	newXRequestID := uuid.NewString()
-
 	req.Header = http.Header{
 		"X-VISITOR-ID":      {visitorID},
 		"Accept":            {"application/json, text/plain, */*"},
@@ -829,7 +962,6 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		"Accept-Language":   {"en-US,en;q=0.9"},
 		"X-CLIENT-PLATFORM": {"iPhone"},
 		"X-CHANNEL-ID":      {"APPS"},
-		// Update x-sapphire-context to use dynamic IDs AND passed-in storeID
 		"x-sapphire-context": {fmt.Sprintf("app_name=Target&app_version=%s&base_membership=true&card_membership=true&channel=apps&device=iPhone15,3&in_store=false&loyalty_id=%s&member_id=%s&os_family=iOS&os_version=18.5&paid_membership=false&profile_created_date=2022-02-21T20:35:57.859Z&redcard_holder=true&source=flagship_ios&store_id=%s&tm=false&visitor_id=%s&wholeAppTest=true",
 			mobileAppVersion, loyaltyID, memberID, storeID, visitorID)},
 		"X-REQUEST-ID":   {newXRequestID},
@@ -844,108 +976,71 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		},
 	}
 
-	resp, err := client.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
-		log.Printf("TCIN %s (%s via %s): Failed to execute request: %v", tcin, apiType, client.GetProxy(), err)
+		log.Printf("TCIN %s: Failed to execute API request: %v", tcin, err)
 		return err
 	}
 	defer resp.Body.Close()
 
-	duration := time.Since(startTime)
-	log.Printf("TCIN %s (%s via %s): Request completed in %s. Status: %s (%d)", tcin, apiType, client.GetProxy(), duration, resp.Status, resp.StatusCode)
+	//duration := time.Since(startTime)
+	//log.Printf("TCIN %s: API Request completed in %s. Status: %s (%d)", tcin, duration, resp.Status, resp.StatusCode)
 
 	body, errReadBody := io.ReadAll(resp.Body)
 	if errReadBody != nil {
-		log.Printf("TCIN %s (%s via %s): Failed to read response body: %v", tcin, apiType, client.GetProxy(), errReadBody)
+		log.Printf("TCIN %s: Failed to read API response body: %v", tcin, errReadBody)
 		return errReadBody
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		log.Printf("WARN: TCIN %s (%s via %s): RATE LIMITED BY TARGET API (HTTP 429). Body: %s", tcin, apiType, client.GetProxy(), string(body))
+		log.Printf("WARN: TCIN %s: RATE LIMITED BY TARGET API (HTTP 429). Body: %s", tcin, string(body))
 		return ErrRateLimited
 	}
-
 	if resp.StatusCode == http.StatusNotFound {
-		log.Printf("WARN: TCIN %s (%s via %s): Product/Endpoint NOT FOUND (HTTP 404). May indicate rate limit/block or invalid item. Body: %s", tcin, apiType, client.GetProxy(), string(body))
+		log.Printf("WARN: TCIN %s: Product/Endpoint NOT FOUND (HTTP 404) via API. Body: %s", tcin, string(body))
 		return ErrNotFound
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("TCIN %s (%s via %s): Non-OK HTTP status: %d. Body: %s", tcin, apiType, client.GetProxy(), resp.StatusCode, string(body))
-		return fmt.Errorf("non-OK HTTP status: %d for TCIN %s", resp.StatusCode, tcin)
+		log.Printf("TCIN %s: Non-OK HTTP status from API: %d. Body: %s", tcin, resp.StatusCode, string(body))
+		return fmt.Errorf("non-OK HTTP status from API: %d for TCIN %s", resp.StatusCode, tcin)
 	}
 
 	var responseData MobileResponseData
 	if err := json.Unmarshal(body, &responseData); err != nil {
-		log.Printf("TCIN %s (%s via %s): Failed to unmarshal JSON: %v. Body: %s", tcin, apiType, client.GetProxy(), err, string(body))
+		log.Printf("TCIN %s: Failed to unmarshal API JSON: %v. Body: %s", tcin, err, string(body))
 		return err
 	}
-
 	product := responseData.Data.Product
-
 	if product.TCIN == "" {
-		log.Printf("TCIN %s (%s via %s): Product TCIN not found in response. Raw response: %s", tcin, apiType, client.GetProxy(), string(body))
-		return fmt.Errorf("product TCIN not found in response")
+		log.Printf("TCIN %s: Product TCIN not found in API response. Raw response: %s", tcin, string(body))
+		return fmt.Errorf("product TCIN not found in API response for TCIN %s", tcin)
 	}
 
 	cleanedTitle := html.UnescapeString(product.Item.ProductDescription.Title)
 	shippingStatus := product.Fulfillment.ShippingOptions.AvailabilityStatus
 	availableQty := product.Fulfillment.ShippingOptions.AvailableToPromiseQuantity
 
-	// --- Product Image URL Caching and Formatting Logic (with reduced logging) ---
 	productImageCacheMutex.Lock()
 	cachedProductImageURL, foundInCache := productImageCache[tcin]
 	productImageCacheMutex.Unlock()
 
 	var finalProductThumbnailURL string
-	if foundInCache {
-		finalProductThumbnailURL = cachedProductImageURL
+	if !foundInCache {
+		log.Printf("INFO: TCIN %s - Image not yet in cache (pre-fetch may be pending or TCIN is new/failed pre-fetch). No product thumbnail for this check.", tcin)
+		// finalProductThumbnailURL will be its zero value (empty string), which is fine.
 	} else {
-		rawProductImageURL := product.Enrichment.Images.PrimaryImageURL
-
-		if rawProductImageURL != "" {
-			parsedURL, errParse := url.Parse(rawProductImageURL)
-			if errParse == nil {
-				basePath := parsedURL.Path
-				basePath = strings.TrimPrefix(basePath, "http://https/target.scene7.com/is/image/")
-				basePath = strings.TrimPrefix(basePath, "https://target.scene7.com/is/image/")
-				basePath = strings.TrimPrefix(basePath, "//target.scene7.com/is/image/")
-				basePath = strings.TrimPrefix(basePath, "/is/image/")
-				basePath = strings.TrimPrefix(basePath, "is/image/")
-				basePath = strings.TrimPrefix(basePath, "/")
-
-				if basePath != "" {
-					finalProductThumbnailURL = fmt.Sprintf("https://target.scene7.com/is/image/%s?format=%s&width=%d&height=%d",
-						basePath, productThumbnailFormat, productThumbnailWidth, productThumbnailHeight)
-					if rawProductImageURL != finalProductThumbnailURL && !strings.HasSuffix(rawProductImageURL, basePath) {
-						log.Printf("INFO: TCIN %s - Constructed and cached product thumbnail URL: '%s'", tcin, finalProductThumbnailURL)
-					}
-				} else {
-					finalProductThumbnailURL = ""
-				}
-			} else {
-				log.Printf("WARN: TCIN %s - Failed to parse raw product image URL '%s': %v. Will cache as empty.", tcin, rawProductImageURL, errParse)
-				finalProductThumbnailURL = ""
-			}
-		} else {
-			finalProductThumbnailURL = ""
-		}
-		productImageCacheMutex.Lock()
-		productImageCache[tcin] = finalProductThumbnailURL
-		productImageCacheMutex.Unlock()
+		finalProductThumbnailURL = cachedProductImageURL
 	}
-	// --- End Product Image URL Caching Logic ---
 
-	// Apply color to shippingStatus for this log line
 	coloredShippingStatus := shippingStatus
 	if strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0 {
 		coloredShippingStatus = colorGreen + shippingStatus + colorReset
 	} else if strings.Contains(strings.ToUpper(shippingStatus), "OUT_OF_STOCK") || strings.Contains(strings.ToUpper(shippingStatus), "UNAVAILABLE") {
 		coloredShippingStatus = colorRed + shippingStatus + colorReset
-	} // Other statuses (like PRE_ORDER_UNSELLABLE) will remain default color
+	}
 
-	log.Printf("TCIN %s (%s via %s): '%s' - Price: %s, Shipping Status: %s, Qty: %.0f",
-		product.TCIN, apiType, client.GetProxy(), cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty)
+	log.Printf("TCIN %s: '%s' - Price: %s, Shipping Status: %s, Qty: %.0f",
+		product.TCIN, cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty)
 
 	isInStock := strings.ToUpper(shippingStatus) == "IN_STOCK" || availableQty > 0
 
@@ -959,54 +1054,54 @@ func checkProductMobileAPIAndNotify(client tls_client.HttpClient, tcin string, i
 		lastSentTime, found := lastNotificationSent[tcin]
 		cooldownDuration := time.Duration(notificationCooldownMinutes) * time.Minute
 		if found && time.Since(lastSentTime) < cooldownDuration {
-			log.Printf("TCIN %s (%s via %s): IN STOCK but notification suppressed due to cooldown (last sent: %s, remaining: %s). Title: %s",
-				product.TCIN, apiType, client.GetProxy(), lastSentTime.Format(time.RFC1123), (cooldownDuration - time.Since(lastSentTime)).Round(time.Second), cleanedTitle)
+			log.Printf("TCIN %s: IN STOCK but notification suppressed due to cooldown (last sent: %s, remaining: %s). Title: %s",
+				product.TCIN, lastSentTime.Format(time.RFC1123), (cooldownDuration - time.Since(lastSentTime)).Round(time.Second), cleanedTitle)
 			lastNotificationMutex.Unlock()
 		} else {
-			log.Printf("TCIN %s (%s via %s): %sIN STOCK!%s Title: %s. Qty: %.0f. Preparing notification.",
-				product.TCIN, apiType, client.GetProxy(), colorGreen, colorReset, cleanedTitle, availableQty)
+			log.Printf("TCIN %s: %sIN STOCK!%s Title: %s. Qty: %.0f. Preparing notification.",
+				product.TCIN, colorGreen, colorReset, cleanedTitle, availableQty)
 			lastNotificationSent[tcin] = time.Now()
 			lastNotificationMutex.Unlock()
 
-			if discordWebhookURL != "YOUR_DISCORD_WEBHOOK_URL_HERE" && !strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE") {
-				sendDiscordNotification(cleanedTitle, product.Price.FormattedCurrentPrice, product.TCIN, finalProductThumbnailURL, availableQty)
+			if discordWebhookURL != "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE" && !strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE") {
+				sendDiscordNotification(cleanedTitle, product.Price.FormattedCurrentPrice, tcin, finalProductThumbnailURL, availableQty)
 			} else {
-				log.Printf("TCIN %s (%s via %s): Would send Discord notification, but webhook URL is not set.", product.TCIN, apiType, client.GetProxy())
+				log.Printf("TCIN %s: Would send Discord notification, but webhook URL is not set.", product.TCIN)
 			}
 		}
 
 		recheckMutex.Lock()
 		if _, ok := quickRecheckCounters[tcin]; ok {
 			delete(quickRecheckCounters, tcin)
-			log.Printf("TCIN %s (%s via %s): Item is IN_STOCK. Quick re-check schedule cleared.", product.TCIN, apiType, client.GetProxy())
 		}
 		recheckMutex.Unlock()
 
 	} else {
-		log.Printf("TCIN %s (%s via %s): %sOUT OF STOCK%s. Title: %s",
-			product.TCIN, apiType, client.GetProxy(), colorRed, colorReset, cleanedTitle)
+		log.Printf("TCIN %s: %sOUT OF STOCK%s. Title: %s",
+			product.TCIN, colorRed, colorReset, cleanedTitle)
 		if !isQuickRecheck && (!stateKnown || previousState) {
 			recheckMutex.Lock()
 			quickRecheckCounters[tcin] = quickRecheckCount
-			log.Printf("TCIN %s (%s via %s): Item is OUT OF STOCK. Scheduled %d quick re-checks.", product.TCIN, apiType, client.GetProxy(), quickRecheckCount)
 			recheckMutex.Unlock()
 		}
 	}
 	return nil
 }
 
-// sendDiscordNotification updated to remove the @here ping logic.
-func sendDiscordNotification(title, price, tcin, productThumbnailURL string, availableQuantity float64) {
-	if discordWebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE" || strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE") {
+// sendDiscordNotification places product image in the main Image field.
+// Thumbnail is empty. Author icon is Target logo.
+func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string, availableQuantity float64) {
+	if discordWebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE" || strings.Contains(discordWebhookURL, "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE") || discordWebhookURL == "" {
 		log.Println("Discord webhook URL not configured or placeholder. Skipping notification.")
 		return
 	}
 
-	// var messageContent string // Logic for @here removed
-	// if availableQuantity >= 10 {
-	// 	messageContent = "@here"
-	// }
+	var messageContent string
+	if availableQuantity >= 10 {
+		messageContent = "@here"
+	}
 
+	// Timestamp formatting (as corrected previously)
 	notificationTime := time.Now()
 	var timestampStr string
 	locToUse := estLocation
@@ -1040,6 +1135,7 @@ func sendDiscordNotification(title, price, tcin, productThumbnailURL string, ava
 		{Name: "Available Quantity", Value: fmt.Sprintf("%.0f", availableQuantity), Inline: false},
 	}
 
+	// Construct the correct product URL for the embed title's link
 	correctProductURL := fmt.Sprintf("https://www.target.com/p/-/A-%s", tcin)
 
 	embed := DiscordEmbed{
@@ -1047,8 +1143,8 @@ func sendDiscordNotification(title, price, tcin, productThumbnailURL string, ava
 		URL:       correctProductURL,
 		Color:     colorGreen,
 		Fields:    embedFields,
-		Thumbnail: EmbedThumbnail{URL: productThumbnailURL},
-		Image:     EmbedImage{URL: ""},
+		Thumbnail: EmbedThumbnail{URL: ""},                   // Thumbnail (top-right) is empty
+		Image:     EmbedImage{URL: productImageToDisplayURL}, // Product image in main image slot
 		Footer: EmbedFooter{
 			Text:    fmt.Sprintf("Targay Monitor | %s", timestampStr),
 			IconURL: "",
@@ -1061,7 +1157,7 @@ func sendDiscordNotification(title, price, tcin, productThumbnailURL string, ava
 	}
 
 	message := DiscordMessage{
-		// Content field will be empty, effectively removing @here ping
+		Content:  messageContent,
 		Username: "Targay Monitor",
 		Embeds:   []DiscordEmbed{embed},
 	}
@@ -1094,3 +1190,6 @@ func sendDiscordNotification(title, price, tcin, productThumbnailURL string, ava
 		log.Printf("Discord notification for TCIN %s failed with status %d: %s", tcin, resp.StatusCode, string(bodyBytes))
 	}
 }
+
+// min helper function (if not already present or imported via math.Min with float64 conversion)
+// func min(a, b int) int { if a < b { return a }; return b }
