@@ -25,6 +25,7 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 	utls "github.com/bogdanfinn/utls"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
 
@@ -33,20 +34,20 @@ const (
 	// Updated to the new, more official Target logo PNG URL provided by the user.
 	discordEmbedImageURL = "https://corporate.target.com/getmedia/0289d38f-1bb0-48f9-b883-cd05e19b8f98/Target_Bullseye-Logo_Red_transparent.png?width=1144"
 	// Interval in seconds between checking all products
-	checkIntervalSeconds        = 25.0 // Set to a higher value for production (e.g., 300 for 5 minutes)
-	checkIntervalJitterSeconds  = 10   // Max seconds for random jitter
+	checkIntervalSeconds        = 8.0  // Set to a higher value for production (e.g., 300 for 5 minutes)
+	checkIntervalJitterSeconds  = 5    // Max seconds for random jitter
 	proxyTestTimeoutSeconds     = 10   // Timeout for a single proxy test
-	proxyMaxValidationLatencyMS = 500  // Updated: Max latency in MS for a proxy (e.g., 500ms)
-	notificationCooldownMinutes = 60   // Cooldown in minutes before resending a notification for the same TCIN
+	proxyMaxValidationLatencyMS = 5000 // Updated: Max latency in MS for a proxy (e.g., 500ms)
+	notificationCooldownMinutes = 2    // Cooldown in minutes before resending a notification for the same TCIN
 	quickRecheckIntervalSeconds = 5.0  // How often to run the quick re-check cycle
 	quickRecheckCount           = 3    // How many quick re-checks to perform for an OOS item
 	// New for multi-worker
-	numMonitoringWorkers = 6 // Number of concurrent main monitoring workers
+	numMonitoringWorkers = 8 // Number of concurrent main monitoring workers
 
 	// New for Product Thumbnail
 	productThumbnailFormat = "png" // Desired format for product thumbnail
 	productThumbnailWidth  = 150   // Desired width for product thumbnail
-	productThumbnailHeight = 150   // Desired height for product thumbnail
+	productThumbnailHeight = 64    // Desired height for product thumbnail
 
 	// ANSI Color Codes for logging
 	colorReset  = "\033[0m"
@@ -55,6 +56,17 @@ const (
 	colorYellow = "\033[33m"
 	// colorBlue   = "\033[34m" // Example, add if needed
 	productImagePrefetchTimeoutSeconds = 20 // Timeout for pre-fetching individual product page HTML
+
+	// API Response Logging
+	apiResponseLogFile       = "api_responses.log"
+	enableApiResponseLogging = false // Set to false to disable
+
+	// WebSocket Configuration
+	websocketPort      = "6969"
+	highStockThreshold = 10
+	// Dedicated WebSocket Logging
+	webSocketLogFile       = "websocket.log"
+	enableWebSocketLogging = true // Set to false to disable WebSocket file logging
 )
 
 // --- Configuration Variables (to be loaded from .env or defaults) ---
@@ -63,8 +75,8 @@ var (
 	proxyFilePath     string
 	proxyTestURL      string
 
-	// List of TCINs to monitor
-	tcinsToMonitor = []string{"94300069", "94681785", "94636854", "94681770", "94636862", "94721086", "94636860", "94641043", "94300072"} // Added TCIN from desktop example
+	// List of TCINs to monitor - will be loaded from tcins.txt
+	tcinsToMonitor []string
 
 	// Store contexts to rotate through - UPDATED with user-provided data
 	storeContexts = []StoreContext{
@@ -108,6 +120,23 @@ var (
 
 	estLocation *time.Location // For EST timezone formatting
 
+	// For API response logging
+	apiResponseLogMutex sync.Mutex
+
+	// For WebSocket logging
+	webSocketLogMutex sync.Mutex
+
+	// WebSocket server state
+	wsClients      = make(map[*websocket.Conn]bool)
+	wsClientsMutex sync.Mutex
+	wsUpgrader     = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *standard_http.Request) bool { // Allow all origins for simplicity, tighten if needed
+			return true
+		},
+	}
+
 	// List of alternative TLS profiles for rotation, populated with available iOS/Safari profiles
 	alternativeIOSProfiles = []utls.ClientHelloID{
 		profiles.Safari_IOS_18_0.GetClientHelloId(), // Slightly older than current default
@@ -146,6 +175,16 @@ var (
 	// No separate global desktopClient needed if each worker gets one, or if quickRecheck uses its own.
 	quickRecheckDesktopClient tls_client.HttpClient // For quick recheck HTML scraping
 )
+
+// --- WebSocket Structures ---
+
+// WebSocketMessage defines the structure for messages sent to WebSocket clients (e.g., the voice bot)
+type WebSocketMessage struct {
+	TCIN              string  `json:"tcin"`
+	Title             string  `json:"title"`
+	AvailableQuantity float64 `json:"availableQuantity"`
+	ProductURL        string  `json:"productURL"`
+}
 
 // StoreContext holds StoreID, ZipCode, and State for API requests
 type StoreContext struct {
@@ -195,6 +234,7 @@ type MobileShippingOptions struct {
 	AvailabilityStatus         string  `json:"availability_status"`
 	AvailableToPromiseQuantity float64 `json:"available_to_promise_quantity"`
 	LoyaltyAvailabilityStatus  string  `json:"loyalty_availability_status"`
+	ReasonCode                 string  `json:"reason_code,omitempty"`
 }
 type MobileEnrichment struct {
 	Images MobileImages `json:"images"`
@@ -543,6 +583,32 @@ func main() {
 			log.Println("INFO: .env file not found. Using defaults or system environment variables for configuration.")
 		}
 	}
+
+	// Load TCINs from file
+	var errLoadTcins error
+	tcinsToMonitor, errLoadTcins = loadTcinsFromFile("tcins.txt")
+	if errLoadTcins != nil {
+		log.Printf("ERROR: Critical error loading TCINs from 'tcins.txt': %v. Monitor will proceed without TCINs.", errLoadTcins)
+		tcinsToMonitor = []string{} // Ensure it's an empty slice on error
+	}
+	if len(tcinsToMonitor) == 0 {
+		log.Println("WARN: No TCINs loaded to monitor. The application will run but will not check any products.")
+	}
+
+	// Start WebSocket server
+	// Use standard_http for the WebSocket server listener and handler
+	standard_http.HandleFunc("/ws", handleWebSocketConnections)
+	go func() {
+		logMsg := fmt.Sprintf("WebSocket server starting on port %s", websocketPort)
+		log.Println("INFO: " + logMsg) // Keep console log for startup
+		logToWebSocketFile(logMsg)     // Log to dedicated file
+
+		if err := standard_http.ListenAndServe(":"+websocketPort, nil); err != nil {
+			fatalMsg := fmt.Sprintf("WebSocket server ListenAndServe error: %v", err)
+			logToWebSocketFile("FATAL: " + fatalMsg) // Attempt to log to file before fatal exit
+			log.Fatalf("FATAL: " + fatalMsg)         // Console log and exit
+		}
+	}()
 
 	discordWebhookURL = getEnv("DISCORD_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE_PLEASE_UPDATE")
 	proxyFilePath = getEnv("PROXY_FILE_PATH", "proxies.txt")
@@ -1007,6 +1073,17 @@ func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeC
 		return errReadBody
 	}
 
+	// Log the raw API response to a file if enabled
+	if enableApiResponseLogging {
+		proxyUsed := apiClient.GetProxy()
+		if proxyUsed == "" {
+			proxyUsed = "DIRECT"
+		}
+		logMessage := fmt.Sprintf("[%s] TCIN: %s | Status: %d | Proxy: %s | Body: %s\n---\n",
+			time.Now().Format(time.RFC3339Nano), tcin, resp.StatusCode, proxyUsed, string(body))
+		go logToFile(logMessage) // Log concurrently to avoid blocking
+	}
+
 	if resp.StatusCode == http.StatusTooManyRequests {
 		log.Printf("WARN: TCIN %s: RATE LIMITED BY TARGET API (HTTP 429). Body: %s", tcin, string(body))
 		return ErrRateLimited
@@ -1047,27 +1124,34 @@ func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeC
 		finalProductThumbnailURL = cachedProductImageURL
 	}
 
-	coloredShippingStatus := shippingStatus
-	// Determine actual in-stock status more strictly
-	isActuallyInStockForShipping := strings.ToUpper(shippingStatus) == "IN_STOCK"
+	// New stock determination logic based on ReasonCode
+	// An item is considered IN STOCK if ReasonCode is NOT "INVENTORY_UNAVAILABLE".
+	// This includes cases where ReasonCode is empty/absent or has a different value.
+	isInStock := (product.Fulfillment.ShippingOptions.ReasonCode != "INVENTORY_UNAVAILABLE")
 
-	if isActuallyInStockForShipping {
+	coloredShippingStatus := shippingStatus // Default to original status string for logging
+	var stockReasoning string
+
+	if isInStock {
 		coloredShippingStatus = colorGreen + shippingStatus + colorReset
-	} else if strings.Contains(strings.ToUpper(shippingStatus), "OUT_OF_STOCK") ||
-		strings.Contains(strings.ToUpper(shippingStatus), "UNAVAILABLE") ||
-		strings.Contains(strings.ToUpper(shippingStatus), "PRE_ORDER_UNSELLABLE") { // Explicitly color PRE_ORDER_UNSELLABLE as red
+		if product.Fulfillment.ShippingOptions.ReasonCode != "" {
+			stockReasoning = fmt.Sprintf("Considered IN STOCK (ReasonCode: '%s', Original Status: '%s')", product.Fulfillment.ShippingOptions.ReasonCode, shippingStatus)
+		} else {
+			stockReasoning = fmt.Sprintf("Considered IN STOCK (ReasonCode: [absent/empty], Original Status: '%s')", shippingStatus)
+		}
+	} else { // Not in stock (ReasonCode IS "INVENTORY_UNAVAILABLE")
 		coloredShippingStatus = colorRed + shippingStatus + colorReset
-	} // Other statuses will remain default color
+		stockReasoning = fmt.Sprintf("Considered OUT OF STOCK (ReasonCode: '%s', Original Status: '%s')", product.Fulfillment.ShippingOptions.ReasonCode, shippingStatus)
+	}
+	log.Printf("INFO: TCIN %s - %s", tcin, stockReasoning) // Log the reasoning
 
-	log.Printf("TCIN %s: '%s' - Price: %s, Shipping Status: %s, Qty: %.0f",
-		product.TCIN, cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty)
-
-	// Use the stricter in-stock definition for notifications and state
-	isInStock := isActuallyInStockForShipping
+	// Log the main status line - coloredShippingStatus reflects the ReasonCode logic
+	log.Printf("TCIN %s: '%s' - Price: %s, Display Status: %s, Qty: %.0f (API Status: '%s', ReasonCode: '%s')",
+		product.TCIN, cleanedTitle, product.Price.FormattedCurrentPrice, coloredShippingStatus, availableQty, shippingStatus, product.Fulfillment.ShippingOptions.ReasonCode)
 
 	stateMutex.Lock()
 	previousState, stateKnown := lastKnownStockState[tcin]
-	lastKnownStockState[tcin] = isInStock // Update state based on isActuallyInStockForShipping
+	lastKnownStockState[tcin] = isInStock // Update state based on isInStock
 	stateMutex.Unlock()
 
 	if isInStock { // This now correctly reflects only if status was truly "IN_STOCK"
@@ -1088,6 +1172,12 @@ func checkProductMobileAPIAndNotify(apiClient tls_client.HttpClient, htmlScrapeC
 				sendDiscordNotification(cleanedTitle, product.Price.FormattedCurrentPrice, tcin, finalProductThumbnailURL, availableQty)
 			} else {
 				log.Printf("TCIN %s: Would send Discord notification, but webhook URL is not set.", product.TCIN)
+			}
+
+			// WebSocket Notification for high stock
+			if availableQty >= highStockThreshold {
+				productURL := fmt.Sprintf("https://www.target.com/p/-/A-%s", tcin)
+				go broadcastHighStockNotification(product.TCIN, cleanedTitle, productURL, availableQty) // Run in a goroutine to avoid blocking
 			}
 		}
 
@@ -1120,9 +1210,7 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 	}
 
 	var messageContent string
-	if availableQuantity >= 10 {
-		messageContent = "@here"
-	}
+	messageContent = ""
 
 	// Timestamp formatting (as corrected previously)
 	notificationTime := time.Now()
@@ -1138,7 +1226,7 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 	timeOnlyFormatWithSeconds := "3:04:05 PM"
 	fullDateTimeFormatWithSeconds := "Mon, Jan 2, 2006 at 3:04:05 PM"
 	if yNotif == yCurr && mNotif == mCurr && dNotif == dCurr {
-		timestampStr = fmt.Sprintf("Today at %s", notificationTimeInLoc.Format(timeOnlyFormatWithSeconds))
+		timestampStr = fmt.Sprintf("Today at %s EST", notificationTimeInLoc.Format(timeOnlyFormatWithSeconds))
 	} else {
 		yesterday := currentTimeInLoc.AddDate(0, 0, -1)
 		yYest, mYest, dYest := yesterday.Date()
@@ -1151,11 +1239,18 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 
 	colorGreen := 0x00FF00
 
+	var displayQuantityStr string
+	if availableQuantity == 0 {
+		displayQuantityStr = "1+"
+	} else {
+		displayQuantityStr = fmt.Sprintf("%.0f", availableQuantity)
+	}
+
 	embedFields := []EmbedField{
 		{Name: "Price", Value: price, Inline: true},
 		{Name: "TCIN", Value: tcin, Inline: true},
 		{Name: "Status", Value: "IN STOCK", Inline: false},
-		{Name: "Available Quantity", Value: fmt.Sprintf("%.0f", availableQuantity), Inline: false},
+		{Name: "Available Quantity", Value: displayQuantityStr, Inline: false},
 	}
 
 	correctProductURL := fmt.Sprintf("https://www.target.com/p/-/A-%s", tcin)
@@ -1217,5 +1312,173 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 	}
 }
 
+// logToFile writes a message to the designated API response log file.
+// It uses a mutex to ensure thread-safe writes.
+func logToFile(message string) {
+	if !enableApiResponseLogging {
+		return
+	}
+	apiResponseLogMutex.Lock()
+	defer apiResponseLogMutex.Unlock()
+
+	f, err := os.OpenFile(apiResponseLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("ERROR: API_LOG - Failed to open log file '%s': %v", apiResponseLogFile, err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(message); err != nil {
+		log.Printf("ERROR: API_LOG - Failed to write to log file '%s': %v", apiResponseLogFile, err)
+	}
+}
+
+// logToWebSocketFile writes a message to the designated WebSocket log file.
+func logToWebSocketFile(message string) {
+	if !enableWebSocketLogging {
+		return
+	}
+	webSocketLogMutex.Lock()
+	defer webSocketLogMutex.Unlock()
+
+	f, err := os.OpenFile(webSocketLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("ERROR: WEBSOCKET_LOG - Failed to open log file '%s': %v", webSocketLogFile, err)
+		return
+	}
+	defer f.Close()
+
+	// Add timestamp to the message before writing
+	logEntry := fmt.Sprintf("[%s] %s\n", time.Now().Format(time.RFC3339Nano), message)
+	if _, err := f.WriteString(logEntry); err != nil {
+		log.Printf("ERROR: WEBSOCKET_LOG - Failed to write to log file '%s': %v", webSocketLogFile, err)
+	}
+}
+
 // min helper function (if not already present or imported via math.Min with float64 conversion)
 // func min(a, b int) int { if a < b { return a }; return b }
+
+// loadTcinsFromFile reads TCINs from a text file, one TCIN per line.
+// Lines starting with # and empty lines are ignored.
+func loadTcinsFromFile(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("INFO: TCIN file '%s' not found. No TCINs will be monitored.", filePath)
+			return nil, nil // Not a fatal error, just means no TCINs
+		}
+		return nil, fmt.Errorf("error opening TCIN file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	var loadedTcins []string
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") { // Skip empty lines and comments
+			continue
+		}
+		// Basic validation: check if it looks like a TCIN (e.g., numeric and typical length)
+		if matched, _ := regexp.MatchString(`^[0-9]{8,12}$`, line); !matched {
+			log.Printf("WARN: Invalid TCIN format on line %d in %s: '%s' (skipped)", lineNumber, filePath, line)
+			continue
+		}
+		loadedTcins = append(loadedTcins, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading TCIN file %s: %w", filePath, err)
+	}
+
+	if len(loadedTcins) == 0 {
+		log.Printf("INFO: No valid TCINs found in '%s'.", filePath)
+	} else {
+		log.Printf("Successfully loaded %d TCINs to monitor from '%s'.", len(loadedTcins), filePath)
+	}
+	return loadedTcins, nil
+}
+
+// --- WebSocket Functions ---
+
+func handleWebSocketConnections(w standard_http.ResponseWriter, r *standard_http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		errMsg := fmt.Sprintf("Failed to upgrade connection: %v", err)
+		log.Printf("ERROR: WEBSOCKET - %s", errMsg) // Keep critical error on console
+		logToWebSocketFile("ERROR: " + errMsg)
+		return
+	}
+	// defer conn.Close() // Closing is handled on error or disconnection
+
+	wsClientsMutex.Lock()
+	wsClients[conn] = true
+	wsClientsMutex.Unlock()
+	clientConnectedMsg := fmt.Sprintf("Client connected: %s. Total clients: %d", conn.RemoteAddr(), len(wsClients))
+	log.Println("INFO: WEBSOCKET - " + clientConnectedMsg) // Optional: keep on console for visibility
+	logToWebSocketFile(clientConnectedMsg)
+
+	// Keep connection alive and detect disconnection
+	// The voice bot might not send any messages, but this loop helps detect closure.
+	for {
+		// You can set a read deadline if you expect pings or want to timeout inactive connections
+		// conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		messageType, p, err := conn.ReadMessage()
+		if err != nil {
+			wsClientsMutex.Lock()
+			delete(wsClients, conn)
+			wsClientsMutex.Unlock()
+
+			var disconnectMsg string
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				disconnectMsg = fmt.Sprintf("Client %s disconnected with error: %v. Total clients: %d", conn.RemoteAddr(), err, len(wsClients))
+				log.Printf("WARN: WEBSOCKET - %s", disconnectMsg) // Keep on console
+			} else {
+				disconnectMsg = fmt.Sprintf("Client %s disconnected. Total clients: %d", conn.RemoteAddr(), len(wsClients))
+				log.Println("INFO: WEBSOCKET - " + disconnectMsg) // Optional: keep on console
+			}
+			logToWebSocketFile(disconnectMsg)
+			_ = conn.Close() // Ensure connection is closed from server side
+			break            // Exit the loop
+		}
+		// For now, we don't expect messages from the voice bot, but you could handle them here.
+		receivedMsg := fmt.Sprintf("Received message from %s (type %d): %s", conn.RemoteAddr(), messageType, string(p))
+		// log.Println("DEBUG: WEBSOCKET - " + receivedMsg) // Optional: console debug
+		logToWebSocketFile("DEBUG: " + receivedMsg)
+	}
+}
+
+func broadcastHighStockNotification(tcin, title, productURL string, quantity float64) {
+	wsClientsMutex.Lock()
+	defer wsClientsMutex.Unlock()
+
+	if len(wsClients) == 0 {
+		// logToWebSocketFile("No clients connected, skipping broadcast.") // Optional: reduce noise
+		return
+	}
+
+	message := WebSocketMessage{
+		TCIN:              tcin,
+		Title:             title,
+		AvailableQuantity: quantity,
+		ProductURL:        productURL,
+	}
+
+	broadcastMsg := fmt.Sprintf("Broadcasting high stock for TCIN %s ('%s', Qty: %.0f) to %d clients.", tcin, title, quantity, len(wsClients))
+	log.Println("INFO: WEBSOCKET - " + broadcastMsg) // Optional: keep on console
+	logToWebSocketFile(broadcastMsg)
+
+	for client := range wsClients {
+		err := client.WriteJSON(message) // WriteJSON is convenient for sending structured data
+		if err != nil {
+			errorMsg := fmt.Sprintf("Error sending message to client %s: %v. Removing client.", client.RemoteAddr(), err)
+			log.Printf("ERROR: WEBSOCKET - %s", errorMsg) // Keep error on console
+			logToWebSocketFile("ERROR: " + errorMsg)
+			_ = client.Close() // Close the connection on error
+			delete(wsClients, client)
+		}
+	}
+}
+
+// --- End WebSocket Functions ---
