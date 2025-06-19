@@ -1,3 +1,5 @@
-# targay-monitor
+### Product monitor for target.com
+made with vibes only
+no bad vibes plz
 
-good vibes only
+![Webhook Example](webhook_example.png)
