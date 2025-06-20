@@ -12,7 +12,7 @@ import (
 	"io"
 	"log"
 	mrand "math/rand"
-	standard_http "net/http"
+	std_http "net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -42,7 +42,7 @@ const (
 	quickRecheckIntervalSeconds = 5.0  // How often to run the quick re-check cycle
 	quickRecheckCount           = 3    // How many quick re-checks to perform for an OOS item
 	// New for multi-worker
-	numMonitoringWorkers = 8 // Number of concurrent main monitoring workers
+	numMonitoringWorkers = 12 // Number of concurrent main monitoring workers
 
 	// New for Product Thumbnail
 	productThumbnailFormat = "png" // Desired format for product thumbnail
@@ -63,7 +63,7 @@ const (
 
 	// WebSocket Configuration
 	websocketPort      = "6969"
-	highStockThreshold = 10
+	highStockThreshold = 9
 	// Dedicated WebSocket Logging
 	webSocketLogFile       = "websocket.log"
 	enableWebSocketLogging = true // Set to false to disable WebSocket file logging
@@ -132,7 +132,7 @@ var (
 	wsUpgrader     = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
-		CheckOrigin: func(r *standard_http.Request) bool { // Allow all origins for simplicity, tighten if needed
+		CheckOrigin: func(r *std_http.Request) bool { // Allow all origins for simplicity, tighten if needed
 			return true
 		},
 	}
@@ -416,7 +416,7 @@ func validateProxies(initialProxies []string) []string {
 				return
 			}
 			defer ipifyResp.Body.Close()
-			if ipifyResp.StatusCode != standard_http.StatusOK {
+			if ipifyResp.StatusCode != std_http.StatusOK {
 				log.Printf("WARN: Proxy Test (ipify) - Proxy '%s' returned non-OK status (%d) from '%s' (latency: %s)", pStr, ipifyResp.StatusCode, proxyTestURL, ipifyRequestDuration)
 				return
 			}
@@ -534,7 +534,7 @@ func preFetchProductImages() {
 				pageResp, pageRespErr := preFetchClient.Do(pageReq)
 				if pageRespErr == nil {
 					defer pageResp.Body.Close()
-					if pageResp.StatusCode == standard_http.StatusOK {
+					if pageResp.StatusCode == std_http.StatusOK {
 						htmlBody, readErr := io.ReadAll(pageResp.Body)
 						if readErr == nil {
 							re := regexp.MustCompile(`https://target\.scene7\.com/is/image/Target/[A-Za-z0-9_-]+`)
@@ -597,13 +597,13 @@ func main() {
 
 	// Start WebSocket server
 	// Use standard_http for the WebSocket server listener and handler
-	standard_http.HandleFunc("/ws", handleWebSocketConnections)
+	std_http.HandleFunc("/ws", handleWebSocketConnections)
 	go func() {
 		logMsg := fmt.Sprintf("WebSocket server starting on port %s", websocketPort)
 		log.Println("INFO: " + logMsg) // Keep console log for startup
 		logToWebSocketFile(logMsg)     // Log to dedicated file
 
-		if err := standard_http.ListenAndServe(":"+websocketPort, nil); err != nil {
+		if err := std_http.ListenAndServe(":"+websocketPort, nil); err != nil {
 			fatalMsg := fmt.Sprintf("WebSocket server ListenAndServe error: %v", err)
 			logToWebSocketFile("FATAL: " + fatalMsg) // Attempt to log to file before fatal exit
 			log.Fatalf("FATAL: " + fatalMsg)         // Console log and exit
@@ -1289,19 +1289,20 @@ func sendDiscordNotification(title, price, tcin, productImageToDisplayURL string
 		return
 	}
 
-	req, err := standard_http.NewRequest(standard_http.MethodPost, discordWebhookURL, bytes.NewBuffer(payload))
+	req, err := std_http.NewRequest(std_http.MethodPost, discordWebhookURL, bytes.NewBuffer(payload))
 	if err != nil {
 		log.Printf("Failed to create Discord request for TCIN %s: %v", tcin, err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	httpClient := &standard_http.Client{Timeout: 10 * time.Second}
+	httpClient := &std_http.Client{Timeout: 10 * time.Second}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("Failed to send Discord notification for TCIN %s: %v", tcin, err)
 		return
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -1402,7 +1403,7 @@ func loadTcinsFromFile(filePath string) ([]string, error) {
 
 // --- WebSocket Functions ---
 
-func handleWebSocketConnections(w standard_http.ResponseWriter, r *standard_http.Request) {
+func handleWebSocketConnections(w std_http.ResponseWriter, r *std_http.Request) {
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to upgrade connection: %v", err)
